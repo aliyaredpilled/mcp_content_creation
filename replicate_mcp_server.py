@@ -1,4 +1,5 @@
 import os
+import replicate # Убедимся, что этот импорт есть
 # import replicate # Удаляем, т.к. используется в replicate_client
 import requests
 from pathlib import Path
