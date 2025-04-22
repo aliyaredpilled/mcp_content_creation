@@ -338,6 +338,180 @@ def generate_and_save_tts(
         logger.exception("Неожиданная ошибка при сохранении TTS аудиофайла")
         return [f"Неожиданная ошибка при сохранении TTS: {e}"] # Возвращаем ошибку в списке
 
+# --- НОВЫЙ Инструмент MCP для Нескольких Видео ---
+@mcp.tool()
+def generate_and_save_multiple_videos(
+    video_requests: list[dict],
+    base_output_dir: str,
+    model_name: str, # <-- Добавляем единую модель сюда
+    # base_filename_prefix: str = "multi_video", # <-- Убираем базовый префикс
+) -> list[str]:
+    """
+    Генерирует несколько видео с помощью Replicate, используя ОДНУ указанную модель
+    на основе списка запросов, сохраняет их в базовую директорию и пытается открыть.
+    Возвращает список путей к сохраненным файлам и/или сообщения об ошибках.
+
+    Args:
+        video_requests: Список словарей. Каждый словарь представляет один запрос
+                        и должен содержать ключи:
+                        - 'prompt' (str): Текстовый промпт для генерации.
+                        - 'first_frame_image_path' (str): Абсолютный путь к файлу изображения для ПЕРВОГО кадра (ОБЯЗАТЕЛЬНО).
+                        Опциональные ключи:
+                        - 'end_image_path' (str): Абсолютный путь к файлу изображения для ПОСЛЕДНЕГО кадра (только для 'kling').
+                        - 'output_filename' (str): Желаемое имя файла (без расширения).
+                                                   Если не указано, будет сгенерировано.
+        base_output_dir: Абсолютный путь к базовой папке для сохранения всех видео.
+        model_name: Название модели для использования ('minimax' или 'kling'), применяется ко ВСЕМ запросам, лучше клинг!)
+
+    Returns:
+        Список строк: содержит пути к успешно сохраненным видеофайлам
+        и/или сообщения об ошибках для каждого запроса.
+    """
+    logger.info(
+        f"Вызов generate_and_save_multiple_videos: "
+        # f"{len(video_requests)} запросов, base_dir='{base_output_dir}', base_prefix='{base_filename_prefix}'"
+        # f"{len(video_requests)} запросов, base_dir='{base_output_dir}'"
+        f"{len(video_requests)} запросов, модель='{model_name}', base_dir='{base_output_dir}'"
+    )
+
+    results = []
+    processed_count = 0
+    error_count = 0
+
+    # --- Валидация входных данных ---
+    if not isinstance(video_requests, list):
+        error_msg = "Ошибка: 'video_requests' должен быть списком."
+        logger.error(error_msg)
+        return [error_msg]
+    if not base_output_dir:
+        error_msg = "Ошибка: 'base_output_dir' не может быть пустым."
+        logger.error(error_msg)
+        return [error_msg]
+
+    # --- Создание базовой директории ---
+    try:
+        save_directory = Path(base_output_dir)
+        save_directory.mkdir(parents=True, exist_ok=True)
+        logger.debug(f"Базовая директория для сохранения видео: {save_directory.resolve()}")
+    except OSError as e:
+        error_msg = f"Ошибка создания базовой директории {save_directory}: {e}"
+        logger.exception(error_msg)
+        return [error_msg]
+    except Exception as e:
+        error_msg = f"Неожиданная ошибка при создании директории {base_output_dir}: {e}"
+        logger.exception(error_msg)
+        return [error_msg]
+
+
+    # --- Обработка каждого запроса ---
+    for i, request_data in enumerate(video_requests):
+        request_index = i + 1
+        logger.info(f"Обработка запроса {request_index}/{len(video_requests)}...")
+
+        if not isinstance(request_data, dict):
+            error_msg = f"Ошибка запроса {request_index}: Элемент в 'video_requests' должен быть словарем."
+            logger.error(error_msg)
+            results.append(error_msg)
+            error_count += 1
+            continue
+
+        # Извлечение параметров из словаря запроса
+        prompt = request_data.get("prompt")
+        # model_name = request_data.get("model_name") # <-- Используем общую модель
+        first_frame_path = request_data.get("first_frame_image_path") # Проверяем ниже
+        end_frame_path = request_data.get("end_image_path")       # Может быть None
+        output_filename_base = request_data.get("output_filename") # Может быть None
+
+        # Проверка обязательных полей
+        # if not prompt or not model_name: # <-- Убираем model_name из этой проверки
+        if not prompt:
+            # error_msg = f"Ошибка запроса {request_index}: Отсутствуют обязательные ключи 'prompt' или 'model_name'."
+            error_msg = f"Ошибка запроса {request_index}: Отсутствует обязательный ключ 'prompt'."
+            logger.error(error_msg)
+            results.append(error_msg)
+            error_count += 1
+            continue
+
+        # --- Новая проверка: Обязательный first_frame_path ---
+        if not first_frame_path:
+            error_msg = f"Ошибка запроса {request_index}: Отсутствует обязательный ключ 'first_frame_image_path'."
+            logger.error(error_msg)
+            results.append(error_msg)
+            error_count += 1
+            continue
+        # Дополнительно проверим, что путь не пустой и существует (базовая проверка)
+        if not Path(first_frame_path).is_file():
+            error_msg = f"Ошибка запроса {request_index}: Файл для 'first_frame_image_path' не найден: {first_frame_path}"
+            logger.error(error_msg)
+            results.append(error_msg)
+            error_count += 1
+            continue
+        # -----------------------------------------------------
+
+        logger.info(
+            # f"  Запрос {request_index}: модель='{model_name}', prompt='{prompt[:30]}...', "
+            f"  Запрос {request_index}: prompt='{prompt[:30]}...', " # Модель теперь общая
+            f"frame='{first_frame_path}', end_frame='{end_frame_path}'"
+        )
+
+        # --- Вызов API ---
+        try:
+            api_result = call_replicate_video_api(
+                prompt=prompt,
+                model_name=model_name, # <-- Используем общую модель
+                first_frame_image_path=first_frame_path,
+                end_image_path=end_frame_path
+            )
+
+            if not isinstance(api_result, str) or not api_result.startswith("http"):
+                error_message = f"Ошибка API Replicate для запроса {request_index}: {api_result}"
+                logger.error(error_message)
+                results.append(error_message)
+                error_count += 1
+                continue
+
+            video_url = api_result
+            logger.info(f"  Запрос {request_index}: получен URL видео: {video_url}")
+
+            # --- Скачивание и сохранение ---
+            # Формируем имя файла: используем указанное или генерируем
+            if output_filename_base:
+                # Убираем возможное расширение, если пользователь его добавил
+                if '.' in output_filename_base:
+                    output_filename_base = os.path.splitext(output_filename_base)[0]
+                filename = f"{output_filename_base}.mp4"
+            else:
+                # Генерируем имя, если оно не указано
+                filename = f"video_{request_index}_{uuid.uuid4().hex[:6]}.mp4"
+
+            # filename = f"{base_filename_prefix}_{request_index}_{uuid.uuid4().hex[:6]}.mp4"
+            save_path = save_directory / filename
+            logger.debug(f"  Запрос {request_index}: скачивание видео в {save_path}...")
+
+            if download_file(video_url, save_path):
+                saved_file_path = str(save_path)
+                logger.info(f"  Запрос {request_index}: видео успешно сохранено: {saved_file_path}")
+                results.append(saved_file_path)
+                processed_count += 1
+                _try_open_file(save_path) # Попытка открыть
+            else:
+                error_msg = f"Ошибка скачивания для запроса {request_index}."
+                logger.error(error_msg)
+                results.append(error_msg)
+                error_count += 1
+
+        except Exception as e:
+            error_msg = f"Неожиданная ошибка при обработке запроса {request_index}: {e}"
+            logger.exception(error_msg)
+            results.append(error_msg)
+            error_count += 1
+
+    logger.info(
+        f"generate_and_save_multiple_videos завершен. "
+        f"Успешно обработано: {processed_count}, с ошибками: {error_count}."
+    )
+    return results
+
 # --- Убираем блок запуска сервера ---
 # import asyncio # Больше не нужен
 # from mcp.server.stdio import stdio_server # Больше не нужен
