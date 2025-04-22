@@ -7,4 +7,7 @@ __pycache__/
 generated_*
 
 # Environment variables
-.env 
+.env
+
+# Virtual environment
+venv/ 

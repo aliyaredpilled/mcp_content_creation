@@ -1,5 +1,5 @@
 requests
 python-dotenv
-mcp-fastmcp
+fastmcp
 replicate
 elevenlabs 

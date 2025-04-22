@@ -15,11 +15,12 @@ import sys # Для вывода в stderr
 
 # --- Настройка базового логгера ---
 log_format = '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-logging.basicConfig(level=logging.INFO, # Установи уровень INFO или DEBUG
+# Изменяем уровень логирования на DEBUG для большей детализации
+logging.basicConfig(level=logging.DEBUG, 
                     format=log_format,
                     handlers=[
                         logging.StreamHandler(sys.stderr), # Вывод в stderr (как print)
-                        # logging.FileHandler("mcp_server.log") # Опционально: запись в файл
+                        logging.FileHandler("mcp_server.log"), # Опционально: запись в файл
                     ])
 
 # Получение логгера для текущего модуля
@@ -32,7 +33,7 @@ logging.getLogger("elevenlabs").setLevel(logging.WARNING)
 
 # --- Константы и Настройки ---
 # MODEL_ID = "..." # Удаляем, перенесено в replicate_client
-DEFAULT_ASPECT_RATIO = "1:1" # Соотношение по умолчанию, если не указано
+DEFAULT_ASPECT_RATIO = "9:16" # Соотношение по умолчанию, если не указано
 
 # Загрузка API ключа из .env
 load_dotenv()
@@ -59,7 +60,8 @@ def download_file(url: str, save_path: Path) -> bool:
         logger.info(f"Файл сохранен: {save_path}")
         return True
     except requests.exceptions.RequestException as e:
-        logger.error(f"Ошибка скачивания {url}: {e}")
+        # Добавляем exc_info=True для полного трейсбека в логах
+        logger.error(f"Ошибка скачивания {url}: {e}", exc_info=True)
         return False
     except Exception as e:
         logger.exception(f"Неожиданная ошибка сохранения файла {save_path}")
@@ -101,14 +103,13 @@ def generate_and_save_images(
     сохраняет их в локальную папку и пытается открыть. Возвращает список путей к сохраненным файлам.
 
     Args:
-        prompt: Текстовый промпт для генерации.
+        prompt: Текстовый промпт для генерации на английском языке.
         num_outputs: Количество изображений для генерации (обычно 1-4).
-        output_dir: Относительный путь к папке для сохранения.
+        output_dir: Абсолютный путь к папке для сохранения.
         lora_hf_id: (Опционально) Идентификатор LoRA на Hugging Face.
         lora_trigger_word: (Опционально) Ключевое слово для активации LoRA.
         filename_prefix: Префикс для имен файлов (по умолчанию "image").
-        aspect_ratio: Соотношение сторон изображения (например, "1:1", "16:9", "9:16").
-                      По умолчанию "1:1".
+        aspect_ratio: Соотношение сторон изображения (например, "1:1", "16:9", "9:16"). Лучше всего 9:16!)
 
     Returns:
         Список строк с путями к успешно сохраненным файлам или список с одной строкой ошибки.
@@ -169,25 +170,31 @@ def generate_and_save_images(
 
     except Exception as e:
         logger.exception("Неожиданная ошибка при обработке/сохранении файлов изображений")
-        return ["Ошибка при обработке/сохранении файлов изображений"]
+        # Возвращаем конкретное сообщение об ошибке
+        return [f"Неожиданная ошибка при обработке/сохранении изображений: {e}"]
 
 # --- НОВЫЙ Инструмент MCP для Видео ---
 @mcp.tool()
 def generate_and_save_video(
     prompt: str,
     output_dir: str,
-    first_frame_image_path: str = None,
+    model_name: str,
+    first_frame_image_path: str | None = None,
+    end_image_path: str | None = None,
     filename_prefix: str = "video",
 ) -> list[str]:
     """
-    Генерирует видео с помощью Replicate (опционально используя начальный кадр),
-    сохраняет его в локальную папку и пытается открыть.
+    Генерирует видео с помощью Replicate, используя указанную модель (minimax или kling),
+    опционально используя начальный кадр и/или конечный кадр (для kling).
+    Сохраняет его в локальную папку и пытается открыть.
     Возвращает список с путем к сохраненному файлу или сообщение об ошибке.
 
     Args:
         prompt: Текстовый промпт для генерации видео (на английском).
-        output_dir: Относительный путь к папке для сохранения видео.
-        first_frame_image_path: (Опционально) Путь к файлу изображения для первого кадра.
+        output_dir: Абсолютный путь к папке для сохранения видео.
+        model_name: Название модели для использования ('minimax' или 'kling').
+        first_frame_image_path: (Опционально) Абсолютный путь к файлу изображения для первого кадра.
+        end_image_path: (Опционально) Абсолютный путь к файлу изображения для последнего кадра (только для 'kling').
         filename_prefix: Префикс для имени файла (по умолчанию "video").
 
     Returns:
@@ -195,16 +202,21 @@ def generate_and_save_video(
         или одно сообщение об ошибке.
     """
     logger.info(
-        f"Вызов generate_and_save_video: "
+        f"Вызов generate_and_save_video (модель: {model_name}): "
         f"prompt='{prompt[:50]}...', dir='{output_dir}', "
-        f"frame='{first_frame_image_path}', prefix='{filename_prefix}'"
+        f"frame='{first_frame_image_path}', end_frame='{end_image_path}', prefix='{filename_prefix}'"
     )
 
+    # Вызываем функцию клиента, передавая все необходимые параметры
     api_result = call_replicate_video_api(
         prompt=prompt,
-        first_frame_image_path=first_frame_image_path
+        model_name=model_name,
+        first_frame_image_path=first_frame_image_path,
+        end_image_path=end_image_path
     )
 
+    # Проверяем, что результат - это валидный URL (строка, начинающаяся с http)
+    # Эта проверка остается актуальной, т.к. call_replicate_video_api возвращает либо URL, либо строку ошибки
     if not isinstance(api_result, str) or not api_result.startswith("http"):
         error_message = f"Ошибка API Replicate или неверный URL для видео: {api_result}"
         logger.error(error_message)
@@ -238,7 +250,8 @@ def generate_and_save_video(
 
     except Exception as e:
         logger.exception("Неожиданная ошибка при обработке/сохранении видео")
-        return ["Ошибка при обработке/сохранении видео"]
+        # Возвращаем конкретное сообщение об ошибке
+        return [f"Неожиданная ошибка при обработке/сохранении видео: {e}"]
 
 # --- НОВЫЙ Инструмент MCP для ElevenLabs TTS ---
 @mcp.tool()
@@ -257,7 +270,7 @@ def generate_and_save_tts(
 
     Args:
         text: Текст для озвучки.
-        output_dir: Относительный путь к папке для сохранения аудио.
+        output_dir: Абсолютный путь к папке для сохранения аудио.
         voice_id: (Опционально) Идентификатор голоса ElevenLabs.
         filename_prefix: Префикс для имени файла (по умолчанию "tts").
         model_id: (Опционально) Идентификатор модели ElevenLabs.
@@ -319,7 +332,8 @@ def generate_and_save_tts(
 
     except Exception as e:
         logger.exception("Неожиданная ошибка при сохранении/обработке TTS аудио")
-        return ["Ошибка при сохранении/обработке TTS аудио"]
+        # Возвращаем конкретное сообщение об ошибке
+        return [f"Неожиданная ошибка при сохранении/обработке TTS аудио: {e}"]
 
 # --- Запуск Сервера ---
 if __name__ == "__main__":

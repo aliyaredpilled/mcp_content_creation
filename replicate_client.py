@@ -10,6 +10,7 @@ logger = logging.getLogger(__name__)
 # --- Константы и Настройки ---
 MODEL_ID = "lucataco/flux-schnell-lora:2a6b576af31790b470f0a8442e1e9791213fa13799cbb65a9fc1436e96389574"
 VIDEO_MODEL_ID = "minimax/video-01-live"
+KLING_MODEL_ID = "kwaivgi/kling-v1.6-pro"
 
 # Загрузка API ключа из .env
 load_dotenv()
@@ -79,74 +80,145 @@ def call_replicate_api(
         return error_message
     except Exception as e:
         logger.exception("Непредвиденная ошибка при вызове Replicate API изображений")
-        return "Непредвиденная ошибка при вызове Replicate API изображений"
+        # Возвращаем конкретное сообщение об ошибке
+        return f"Непредвиденная ошибка при вызове Replicate API изображений: {e}"
 
 def call_replicate_video_api(
     prompt: str,
-    first_frame_image_path: str = None,
-) -> str | str:
+    model_name: str,
+    first_frame_image_path: str | None = None,
+    end_image_path: str | None = None,
+) -> str:
     """
     Отправляет запрос на генерацию видео в Replicate API,
-    опционально используя начальный кадр.
+    позволяя выбрать модель (minimax или kling) и опционально
+    используя начальный и/или конечный кадр (конечный только для kling).
 
     Args:
         prompt: Текстовый промпт для генерации видео.
+        model_name: Название модели для использования ('minimax' или 'kling'). Лучше клинг!)
         first_frame_image_path: (Опционально) Путь к файлу изображения для первого кадра.
+        end_image_path: (Опционально) Путь к файлу изображения для последнего кадра (только для 'kling').
 
     Returns:
         URL сгенерированного видео или строка с сообщением об ошибке.
     """
-    logger.debug(f"Вызов call_replicate_video_api с frame='{first_frame_image_path}'")
+    logger.debug(f"Вызов call_replicate_video_api (модель: {model_name}) с frame='{first_frame_image_path}', end_frame='{end_image_path}'")
     if not REPLICATE_API_KEY:
         logger.error("REPLICATE_API_TOKEN не настроен.")
         return "Ошибка: REPLICATE_API_TOKEN не настроен."
 
-    image_file_content = None
-    image_info = "Нет"
+    # Проверяем корректность имени модели
+    if model_name not in ["minimax", "kling"]:
+        error_message = f"Неизвестное имя модели: '{model_name}'. Доступные: 'minimax', 'kling'."
+        logger.error(error_message)
+        return f"Ошибка: {error_message}"
+
+    first_frame_image_content = None
+    end_image_content = None
+    first_image_info = "Нет"
+    end_image_info = "Нет"
+
+    # Обработка файла первого кадра
     if first_frame_image_path:
         if not os.path.exists(first_frame_image_path):
             error_message = f"Файл первого кадра не найден: {first_frame_image_path}"
             logger.error(error_message)
+            # Важно закрыть файл конечного кадра, если он был открыт до этой ошибки
+            if end_image_content and not end_image_content.closed: end_image_content.close()
             return f"Ошибка: {error_message}"
         try:
             logger.debug(f"Открытие файла первого кадра: {first_frame_image_path}")
-            image_file_content = open(first_frame_image_path, "rb")
-            image_info = first_frame_image_path
+            first_frame_image_content = open(first_frame_image_path, "rb")
+            first_image_info = os.path.basename(first_frame_image_path) # Используем basename для краткости
         except Exception as e:
-            logger.exception(f"Ошибка при открытии файла {first_frame_image_path}")
-            return f"Ошибка при открытии файла {first_frame_image_path}"
+            logger.exception(f"Ошибка при открытии файла первого кадра {first_frame_image_path}")
+            # Важно закрыть файл конечного кадра, если он был открыт до этой ошибки
+            if end_image_content and not end_image_content.closed: end_image_content.close()
+            return f"Ошибка при открытии файла первого кадра"
+
+    # Обработка файла конечного кадра (только для kling)
+    if model_name == "kling" and end_image_path:
+        if not os.path.exists(end_image_path):
+            error_message = f"Файл конечного кадра не найден: {end_image_path}"
+            logger.error(error_message)
+            # Важно закрыть файл первого кадра, если он был открыт до этой ошибки
+            if first_frame_image_content and not first_frame_image_content.closed: first_frame_image_content.close()
+            return f"Ошибка: {error_message}"
+        try:
+            logger.debug(f"Открытие файла конечного кадра: {end_image_path}")
+            end_image_content = open(end_image_path, "rb")
+            end_image_info = os.path.basename(end_image_path) # Используем basename для краткости
+        except Exception as e:
+            logger.exception(f"Ошибка при открытии файла конечного кадра {end_image_path}")
+            # Важно закрыть файл первого кадра, если он был открыт до этой ошибки
+            if first_frame_image_content and not first_frame_image_content.closed: first_frame_image_content.close()
+            return f"Ошибка при открытии файла конечного кадра"
+    elif model_name != "kling" and end_image_path:
+         logger.warning(f"Параметр end_image_path указан, но будет проигнорирован для модели '{model_name}'.")
+
 
     try:
         client = replicate.Client(api_token=REPLICATE_API_KEY)
+        _model_id_to_use = None
+        input_params = {"prompt": prompt}
+        log_params_info = [] # Собираем инфо о параметрах для лога
 
-        input_params = {
-            "prompt": prompt,
-            "prompt_optimizer": True,
-        }
+        # Настройка параметров в зависимости от модели
+        if model_name == "minimax":
+            _model_id_to_use = VIDEO_MODEL_ID
+            input_params["prompt_optimizer"] = True
+            log_params_info.append("PromptOpt=True")
+        elif model_name == "kling":
+            _model_id_to_use = KLING_MODEL_ID
+            input_params["aspect_ratio"] = "9:16"
+            log_params_info.append("AR=9:16")
+            if end_image_content:
+                input_params["end_image"] = end_image_content
+                log_params_info.append(f"EndFrame={end_image_info}")
 
-        if image_file_content:
-            input_params["first_frame_image"] = image_file_content
-
-        logger.info(f"Запрос Replicate Video ({VIDEO_MODEL_ID}): Кадр={image_info}, PromptOpt=True, Prompt: '{prompt[:60]}...'" )
-
-        if image_file_content:
-            with image_file_content:
-                output_url = client.run(VIDEO_MODEL_ID, input=input_params)
+        # Добавляем первый кадр, если есть
+        if first_frame_image_content:
+            # Используем правильное имя параметра для каждой модели
+            param_name = "start_image" if model_name == "kling" else "first_frame_image"
+            input_params[param_name] = first_frame_image_content
+            log_params_info.append(f"Frame({param_name})={first_image_info}")
         else:
-            output_url = client.run(VIDEO_MODEL_ID, input=input_params)
+            # Если для Kling нет начального кадра, но есть конечный, это нормально
+            if model_name != "kling" or not end_image_content:
+                 # Для Minimax или если у Kling нет ни start ни end - добавляем "Frame=Нет"
+                 log_params_info.append("Frame=Нет")
+            # Если у Kling нет start_image, но есть end_image, мы его уже добавили в лог выше
 
-        if not isinstance(output_url, str):
-            error_message = f"Replicate API вернул не URL для видео: {type(output_url)}"
+        # Формируем строку параметров для лога
+        params_log_str = ", ".join(log_params_info)
+        logger.info(f"Запрос Replicate Video ({_model_id_to_use}): {params_log_str}, Prompt: '{prompt[:60]}...'" )
+
+        # --- Вызов API ---
+        # Файлы должны оставаться открытыми во время вызова run
+        output_object = client.run(_model_id_to_use, input=input_params)
+
+        # --- Новая проверка и извлечение URL ---
+        # Проверяем, что это FileOutput или хотя бы имеет атрибут 'url'
+        if hasattr(output_object, 'url'):
+            video_url = output_object.url # Извлекаем URL
+            # Можно добавить проверку, что video_url это строка, если нужно
+            if not isinstance(video_url, str):
+                 error_message = f"Атрибут 'url' объекта FileOutput не является строкой: {type(video_url)}"
+                 logger.error(error_message)
+                 return f"Ошибка: {error_message}"
+        # Если это неожиданно строка (старое поведение?) - тоже принимаем
+        elif isinstance(output_object, str):
+             logger.warning("Replicate API вернул строку вместо объекта FileOutput. Используем строку как URL.")
+             video_url = output_object
+        # Если ни то, ни другое - ошибка
+        else:
+            error_message = f"Replicate API вернул неожиданный тип для видео: {type(output_object)}"
             logger.error(error_message)
-            # Попробуем извлечь URL, если это список с одним элементом
-            if isinstance(output_url, list) and len(output_url) == 1 and isinstance(output_url[0], str):
-                logger.warning("Replicate API вернул список, предполагаем, что первый элемент списка - это URL.")
-                output_url = output_url[0]
-            else:
-                return f"Ошибка: {error_message}"
+            return f"Ошибка: {error_message}"
 
-        logger.info(f"Replicate API вернул URL видео: {output_url}")
-        return output_url
+        logger.info(f"Replicate API вернул URL видео: {video_url}")
+        return video_url # Возвращаем извлеченный URL
 
     except replicate.exceptions.ReplicateError as e:
         error_message = f"Ошибка API Replicate (видео): {e}"
@@ -154,12 +226,18 @@ def call_replicate_video_api(
         return error_message
     except Exception as e:
         logger.exception("Непредвиденная ошибка при вызове Replicate API (видео)")
-        return "Непредвиденная ошибка при вызове Replicate API (видео)"
+        return f"Непредвиденная ошибка при вызове Replicate API (видео): {e}"
     finally:
-        # Гарантированное закрытие файла, если он был открыт и не использовался в with
-        if image_file_content and not image_file_content.closed:
+        # Гарантированное закрытие ОБОИХ файлов
+        if first_frame_image_content and not first_frame_image_content.closed:
              try:
-                 logger.debug(f"Закрытие файла {first_frame_image_path} в блоке finally.")
-                 image_file_content.close()
+                 logger.debug(f"Закрытие файла первого кадра {first_frame_image_path} в блоке finally.")
+                 first_frame_image_content.close()
              except Exception as close_err:
-                 logger.error(f"Ошибка при закрытии файла {first_frame_image_path} в finally: {close_err}") 
+                 logger.error(f"Ошибка при закрытии файла первого кадра {first_frame_image_path} в finally: {close_err}")
+        if end_image_content and not end_image_content.closed:
+            try:
+                logger.debug(f"Закрытие файла конечного кадра {end_image_path} в блоке finally.")
+                end_image_content.close()
+            except Exception as close_err:
+                 logger.error(f"Ошибка при закрытии файла конечного кадра {end_image_path} в finally: {close_err}") 
