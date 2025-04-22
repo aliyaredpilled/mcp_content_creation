@@ -7,6 +7,7 @@ import uuid
 import subprocess
 from dotenv import load_dotenv
 from mcp.server.fastmcp import FastMCP
+# Возвращаем импорты инструментов
 from replicate_client import call_replicate_api, call_replicate_video_api # <--- Импортируем новую функцию
 from elevenlabs_client import call_elevenlabs_tts_api, DEFAULT_OUTPUT_FORMAT # <--- Импорт новой функции и константы
 import traceback # Добавляем импорт traceback сюда, т.к. он используется в блоке except
@@ -19,8 +20,8 @@ log_format = '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 logging.basicConfig(level=logging.DEBUG, 
                     format=log_format,
                     handlers=[
-                        logging.StreamHandler(sys.stderr), # Вывод в stderr (как print)
-                        logging.FileHandler("mcp_server.log"), # Опционально: запись в файл
+                        # logging.StreamHandler(sys.stderr), # Вывод в stderr (как print)
+                        # logging.FileHandler("mcp_server.log"), # Опционально: запись в файл
                     ])
 
 # Получение логгера для текущего модуля
@@ -45,7 +46,10 @@ load_dotenv()
     # exit() # Не лучшее решение для сервера
 
 # --- Инициализация MCP Сервера ---
+# Убираем явное указание порта
 mcp = FastMCP("Replicate Image Generator")
+
+# --- Возвращаем вспомогательные функции и инструменты --- 
 
 # --- Вспомогательная функция для скачивания ---
 def download_file(url: str, save_path: Path) -> bool:
@@ -179,8 +183,8 @@ def generate_and_save_video(
     prompt: str,
     output_dir: str,
     model_name: str,
-    first_frame_image_path: str | None = None,
-    end_image_path: str | None = None,
+    first_frame_image_path: str = None, # <--- Убираем | None
+    end_image_path: str = None, # <--- Убираем | None
     filename_prefix: str = "video",
 ) -> list[str]:
     """
@@ -253,20 +257,19 @@ def generate_and_save_video(
         # Возвращаем конкретное сообщение об ошибке
         return [f"Неожиданная ошибка при обработке/сохранении видео: {e}"]
 
-# --- НОВЫЙ Инструмент MCP для ElevenLabs TTS ---
+# --- НОВЫЙ Инструмент MCP для TTS ---
 @mcp.tool()
 def generate_and_save_tts(
     text: str,
     output_dir: str,
-    voice_id: str = None,
+    voice_id: str = None, # <--- Уже было без | None, оставляем
     filename_prefix: str = "tts",
-    model_id: str = None,
-    output_format: str = None
+    model_id: str = None, # <--- Уже было без | None, оставляем
+    output_format: str = None # <--- Уже было без | None, оставляем
 ) -> list[str]:
     """
-    Генерирует речь из текста с помощью ElevenLabs TTS, сохраняет аудиофайл
-    в локальную папку и пытается его открыть. Использует значения по умолчанию,
-    если voice_id, model_id или output_format не указаны.
+    Генерирует речь с помощью ElevenLabs, сохраняет ее в локальную папку
+    и пытается открыть. Возвращает список с путем к сохраненному файлу или сообщение об ошибке.
 
     Args:
         text: Текст для озвучки.
@@ -274,7 +277,8 @@ def generate_and_save_tts(
         voice_id: (Опционально) Идентификатор голоса ElevenLabs.
         filename_prefix: Префикс для имени файла (по умолчанию "tts").
         model_id: (Опционально) Идентификатор модели ElevenLabs.
-        output_format: (Опционально) Формат вывода аудио (по умолчанию mp3_44100_128).
+        output_format: (Опционально) Формат аудиофайла (например, 'mp3_44100_128', 'pcm_16000').
+                       По умолчанию используется DEFAULT_OUTPUT_FORMAT из elevenlabs_client.
 
     Returns:
         Список строк: содержит путь к успешно сохраненному аудиофайлу
@@ -282,30 +286,29 @@ def generate_and_save_tts(
     """
     logger.info(
         f"Вызов generate_and_save_tts: "
-        f"text='{text[:50]}...', dir='{output_dir}', "
-        f"voice='{voice_id}', model='{model_id}', format='{output_format}', prefix='{filename_prefix}'"
+        f"voice='{voice_id}', model='{model_id}', dir='{output_dir}', "
+        f"prefix='{filename_prefix}', format='{output_format or DEFAULT_OUTPUT_FORMAT}', text='{text[:50]}...'"
     )
 
-    # Устанавливаем формат по умолчанию, если он не передан
+    # Используем формат по умолчанию из клиента, если не передан явно
     actual_output_format = output_format if output_format else DEFAULT_OUTPUT_FORMAT
-    try:
-        file_extension = actual_output_format.split('_')[0] # Получаем расширение (mp3, pcm и т.д.)
-    except IndexError:
-        logger.warning(f"Не удалось определить расширение из формата '{actual_output_format}'. Используется 'bin'.")
-        file_extension = "bin" # Запасной вариант
+    file_extension = actual_output_format.split("_")[0] # Извлекаем расширение (mp3, pcm, etc.)
 
+    # Вызываем функцию TTS клиента
     api_result = call_elevenlabs_tts_api(
         text=text,
-        voice_id=voice_id, # Передаем None, если не указан, клиент использует свой default
-        model_id=model_id, # Передаем None, если не указан, клиент использует свой default
-        output_format=actual_output_format # Передаем актуальный формат
+        voice_id=voice_id, # Передаем None, если не указан
+        model_id=model_id, # Передаем None, если не указан
+        output_format=actual_output_format
     )
 
-    if isinstance(api_result, str): # Ошибка от API клиента
-        logger.error(f"Ошибка API ElevenLabs: {api_result}")
-        return [api_result]
+    # Проверяем, что результат - это байты
+    if not isinstance(api_result, bytes):
+        error_message = f"Ошибка API ElevenLabs или неверный тип данных: {api_result}" # api_result уже строка ошибки
+        logger.error(error_message)
+        return [error_message]
 
-    audio_bytes = api_result # Теперь это точно байты
+    audio_bytes = api_result
     logger.info(f"Получено {len(audio_bytes)} байт аудио от ElevenLabs API.")
 
     try:
@@ -317,10 +320,11 @@ def generate_and_save_tts(
             logger.exception(f"Не удалось создать директорию {save_directory}")
             return [f"Ошибка создания директории: {e}"]
 
-        filename = f"{filename_prefix}_{uuid.uuid4().hex[:6]}.{file_extension}" # Уникальный ID и правильное расширение
+        filename = f"{filename_prefix}_{uuid.uuid4().hex[:6]}.{file_extension}" # Используем правильное расширение
         save_path = save_directory / filename
         logger.debug(f"Сохранение TTS аудио в {save_path}...")
 
+        # Сохраняем байты в файл
         with open(save_path, "wb") as f:
             f.write(audio_bytes)
 
@@ -331,18 +335,22 @@ def generate_and_save_tts(
         return [saved_file_path] # Возвращаем путь в списке
 
     except Exception as e:
-        logger.exception("Неожиданная ошибка при сохранении/обработке TTS аудио")
-        # Возвращаем конкретное сообщение об ошибке
-        return [f"Неожиданная ошибка при сохранении/обработке TTS аудио: {e}"]
+        logger.exception("Неожиданная ошибка при сохранении TTS аудиофайла")
+        return [f"Неожиданная ошибка при сохранении TTS: {e}"] # Возвращаем ошибку в списке
 
-# --- Запуск Сервера ---
+# --- Убираем блок запуска сервера ---
+# import asyncio # Больше не нужен
+# from mcp.server.stdio import stdio_server # Больше не нужен
+
 if __name__ == "__main__":
-    logger.info("Запуск MCP Replicate Server...")
-    # Здесь можно добавить параметры для mcp.run(), если нужно изменить хост/порт
-    # например: mcp.run(host="0.0.0.0", port=8000)
-    try:
-        mcp.run()
-    except Exception as e:
-        logger.critical("Критическая ошибка при запуске/работе MCP сервера", exc_info=True)
-    finally:
-        logger.info("MCP Replicate Server остановлен.") 
+    logger.info("Запуск FastMCP сервера в режиме STDIN/STDOUT...")
+    # Напрямую вызываем синхронный метод run(), который управляет циклом и stdio
+    mcp.run()
+
+    # Старый код удален:
+    # async def main():
+    #     logger.info("Запуск FastMCP сервера в режиме STDIN/STDOUT...")
+    #     async with stdio_server() as (read_stream, write_stream):
+    #         await mcp.run() # <-- Ошибка здесь
+    #
+    # asyncio.run(main())

@@ -10,4 +10,10 @@ generated_*
 .env
 
 # Virtual environment
-venv/ 
+venv/
+
+# Log files
+mcp_server.log
+
+# Cursor config
+.cursor/ 
