@@ -13,6 +13,7 @@ from elevenlabs_client import call_elevenlabs_tts_api, DEFAULT_OUTPUT_FORMAT # <
 import traceback # Добавляем импорт traceback сюда, т.к. он используется в блоке except
 import logging
 import sys # Для вывода в stderr
+import concurrent.futures # <--- Добавляем импорт
 
 # --- Настройка базового логгера ---
 log_format = '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
@@ -338,16 +339,99 @@ def generate_and_save_tts(
         logger.exception("Неожиданная ошибка при сохранении TTS аудиофайла")
         return [f"Неожиданная ошибка при сохранении TTS: {e}"] # Возвращаем ошибку в списке
 
-# --- НОВЫЙ Инструмент MCP для Нескольких Видео ---
+# --- Вспомогательная функция для параллельной обработки видео ---
+def _process_single_video_request(request_data: dict, request_index: int, model_name: str, save_directory: Path) -> str:
+    """
+    Обрабатывает один запрос на генерацию видео.
+    Вызывается в отдельном потоке.
+
+    Args:
+        request_data: Словарь с данными запроса ('prompt', 'first_frame_image_path', ...).
+        request_index: Порядковый номер запроса (для логирования и имен файлов).
+        model_name: Имя модели Replicate.
+        save_directory: Путь к директории для сохранения.
+
+    Returns:
+        Строка с путем к сохраненному файлу или сообщение об ошибке.
+    """
+    logger.info(f"Начало обработки запроса {request_index} в потоке...")
+
+    # Извлечение параметров
+    prompt = request_data.get("prompt")
+    first_frame_path = request_data.get("first_frame_image_path")
+    end_frame_path = request_data.get("end_image_path")
+    output_filename_base = request_data.get("output_filename")
+
+    # Проверки обязательных полей (уже сделаны в основной функции, но можно добавить для надежности)
+    if not prompt or not first_frame_path:
+         # Эта ситуация не должна возникать из-за проверок выше, но на всякий случай
+         error_msg = f"Запрос {request_index}: Внутренняя ошибка - отсутствуют prompt или first_frame_path."
+         logger.error(error_msg)
+         return error_msg
+    if not Path(first_frame_path).is_file(): # Проверка файла здесь тоже важна
+        error_msg = f"Запрос {request_index}: Файл первого кадра не найден: {first_frame_path}"
+        logger.error(error_msg)
+        return error_msg
+
+    logger.info(
+        f"  Запрос {request_index}: Параметры: prompt='{prompt[:30]}...', "
+        f"frame='{first_frame_path}', end_frame='{end_frame_path}'"
+    )
+
+    try:
+        # --- Вызов API --- (Эта часть выполняется в потоке)
+        api_result = call_replicate_video_api(
+            prompt=prompt,
+            model_name=model_name,
+            first_frame_image_path=first_frame_path,
+            end_image_path=end_frame_path
+        )
+
+        if not isinstance(api_result, str) or not api_result.startswith("http"):
+            error_message = f"Ошибка API Replicate для запроса {request_index}: {api_result}"
+            logger.error(f"  {error_message}") # Добавим отступ для логов потока
+            return error_message # Возвращаем ошибку из потока
+
+        video_url = api_result
+        logger.info(f"  Запрос {request_index}: получен URL видео: {video_url}")
+
+        # --- Скачивание и сохранение --- (Эта часть тоже выполняется в потоке)
+        if output_filename_base:
+            if '.' in output_filename_base:
+                output_filename_base = os.path.splitext(output_filename_base)[0]
+            filename = f"{output_filename_base}.mp4"
+        else:
+            filename = f"video_{request_index}_{uuid.uuid4().hex[:6]}.mp4"
+
+        save_path = save_directory / filename
+        logger.debug(f"  Запрос {request_index}: скачивание видео в {save_path}...")
+
+        if download_file(video_url, save_path):
+            saved_file_path = str(save_path)
+            logger.info(f"  Запрос {request_index}: видео успешно сохранено: {saved_file_path}")
+            _try_open_file(save_path) # Попытка открыть (тоже в потоке)
+            logger.info(f"Обработка запроса {request_index} в потоке завершена успешно.")
+            return saved_file_path # Возвращаем путь из потока
+        else:
+            error_msg = f"Ошибка скачивания для запроса {request_index}. URL: {video_url}"
+            logger.error(f"  {error_msg}")
+            return error_msg # Возвращаем ошибку скачивания из потока
+
+    except Exception as e:
+        error_msg = f"Неожиданная ошибка при обработке запроса {request_index} в потоке: {e}"
+        logger.exception(f"  {error_msg}") # Логируем с трассировкой
+        return error_msg # Возвращаем неожиданную ошибку из потока
+
+# --- ИЗМЕНЕННЫЙ Инструмент MCP для Нескольких Видео (Параллельный) ---
 @mcp.tool()
 def generate_and_save_multiple_videos(
     video_requests: list[dict],
     base_output_dir: str,
-    model_name: str, # <-- Добавляем единую модель сюда
-    # base_filename_prefix: str = "multi_video", # <-- Убираем базовый префикс
+    model_name: str, # <-- Единая модель
+    max_workers: int = 8 # <-- Макс. кол-во параллельных потоков
 ) -> list[str]:
     """
-    Генерирует несколько видео с помощью Replicate, используя ОДНУ указанную модель
+    Генерирует НЕСКОЛЬКО видео ПАРАЛЛЕЛЬНО с помощью Replicate, используя ОДНУ указанную модель
     на основе списка запросов, сохраняет их в базовую директорию и пытается открыть.
     Возвращает список путей к сохраненным файлам и/или сообщения об ошибках.
 
@@ -361,16 +445,15 @@ def generate_and_save_multiple_videos(
                         - 'output_filename' (str): Желаемое имя файла (без расширения).
                                                    Если не указано, будет сгенерировано.
         base_output_dir: Абсолютный путь к базовой папке для сохранения всех видео.
-        model_name: Название модели для использования ('minimax' или 'kling'), применяется ко ВСЕМ запросам, лучше клинг!)
+        model_name: Название модели для использования ('minimax' или 'kling'), применяется ко ВСЕМ запросам. лучше клинг!)
+        max_workers: Максимальное количество потоков для параллельной обработки (по умолчанию 8).
 
     Returns:
         Список строк: содержит пути к успешно сохраненным видеофайлам
         и/или сообщения об ошибках для каждого запроса.
     """
     logger.info(
-        f"Вызов generate_and_save_multiple_videos: "
-        # f"{len(video_requests)} запросов, base_dir='{base_output_dir}', base_prefix='{base_filename_prefix}'"
-        # f"{len(video_requests)} запросов, base_dir='{base_output_dir}'"
+        f"Вызов generate_and_save_multiple_videos (ПАРАЛЛЕЛЬНО, max_workers={max_workers}): "
         f"{len(video_requests)} запросов, модель='{model_name}', base_dir='{base_output_dir}'"
     )
 
@@ -378,7 +461,7 @@ def generate_and_save_multiple_videos(
     processed_count = 0
     error_count = 0
 
-    # --- Валидация входных данных ---
+    # --- Валидация входных данных (остается) ---
     if not isinstance(video_requests, list):
         error_msg = "Ошибка: 'video_requests' должен быть списком."
         logger.error(error_msg)
@@ -387,8 +470,38 @@ def generate_and_save_multiple_videos(
         error_msg = "Ошибка: 'base_output_dir' не может быть пустым."
         logger.error(error_msg)
         return [error_msg]
+    if not model_name:
+         error_msg = "Ошибка: 'model_name' не может быть пустым."
+         logger.error(error_msg)
+         return [error_msg]
 
-    # --- Создание базовой директории ---
+    # --- Предварительная проверка запросов (валидность структуры и обязательных полей) ---
+    valid_requests_with_indices = []
+    for i, req_data in enumerate(video_requests):
+        request_index = i + 1
+        if not isinstance(req_data, dict):
+            error_msg = f"Ошибка запроса {request_index}: Элемент в 'video_requests' должен быть словарем."
+            logger.error(error_msg)
+            results.append(error_msg) # Добавляем ошибку сразу
+            error_count += 1
+            continue
+        prompt = req_data.get("prompt")
+        first_frame_path = req_data.get("first_frame_image_path")
+        if not prompt or not first_frame_path:
+            error_msg = f"Ошибка запроса {request_index}: Отсутствуют обязательные ключи 'prompt' или 'first_frame_image_path'."
+            logger.error(error_msg)
+            results.append(error_msg)
+            error_count += 1
+            continue
+        # Файл проверим внутри потока, чтобы не блокировать основной поток слишком долго
+        valid_requests_with_indices.append((req_data, request_index))
+
+    if not valid_requests_with_indices:
+        logger.warning("Нет валидных запросов для обработки.")
+        # Возвращаем ошибки валидации, если они были
+        return results if results else ["Нет валидных запросов для обработки."]
+
+    # --- Создание базовой директории (остается) ---
     try:
         save_directory = Path(base_output_dir)
         save_directory.mkdir(parents=True, exist_ok=True)
@@ -396,121 +509,282 @@ def generate_and_save_multiple_videos(
     except OSError as e:
         error_msg = f"Ошибка создания базовой директории {save_directory}: {e}"
         logger.exception(error_msg)
-        return [error_msg]
+        results.insert(0, error_msg) # Добавляем в начало списка ошибок
+        return results
     except Exception as e:
         error_msg = f"Неожиданная ошибка при создании директории {base_output_dir}: {e}"
         logger.exception(error_msg)
-        return [error_msg]
+        results.insert(0, error_msg)
+        return results
 
-
-    # --- Обработка каждого запроса ---
-    for i, request_data in enumerate(video_requests):
-        request_index = i + 1
-        logger.info(f"Обработка запроса {request_index}/{len(video_requests)}...")
-
-        if not isinstance(request_data, dict):
-            error_msg = f"Ошибка запроса {request_index}: Элемент в 'video_requests' должен быть словарем."
-            logger.error(error_msg)
-            results.append(error_msg)
-            error_count += 1
-            continue
-
-        # Извлечение параметров из словаря запроса
-        prompt = request_data.get("prompt")
-        # model_name = request_data.get("model_name") # <-- Используем общую модель
-        first_frame_path = request_data.get("first_frame_image_path") # Проверяем ниже
-        end_frame_path = request_data.get("end_image_path")       # Может быть None
-        output_filename_base = request_data.get("output_filename") # Может быть None
-
-        # Проверка обязательных полей
-        # if not prompt or not model_name: # <-- Убираем model_name из этой проверки
-        if not prompt:
-            # error_msg = f"Ошибка запроса {request_index}: Отсутствуют обязательные ключи 'prompt' или 'model_name'."
-            error_msg = f"Ошибка запроса {request_index}: Отсутствует обязательный ключ 'prompt'."
-            logger.error(error_msg)
-            results.append(error_msg)
-            error_count += 1
-            continue
-
-        # --- Новая проверка: Обязательный first_frame_path ---
-        if not first_frame_path:
-            error_msg = f"Ошибка запроса {request_index}: Отсутствует обязательный ключ 'first_frame_image_path'."
-            logger.error(error_msg)
-            results.append(error_msg)
-            error_count += 1
-            continue
-        # Дополнительно проверим, что путь не пустой и существует (базовая проверка)
-        if not Path(first_frame_path).is_file():
-            error_msg = f"Ошибка запроса {request_index}: Файл для 'first_frame_image_path' не найден: {first_frame_path}"
-            logger.error(error_msg)
-            results.append(error_msg)
-            error_count += 1
-            continue
-        # -----------------------------------------------------
-
-        logger.info(
-            # f"  Запрос {request_index}: модель='{model_name}', prompt='{prompt[:30]}...', "
-            f"  Запрос {request_index}: prompt='{prompt[:30]}...', " # Модель теперь общая
-            f"frame='{first_frame_path}', end_frame='{end_frame_path}'"
-        )
-
-        # --- Вызов API ---
-        try:
-            api_result = call_replicate_video_api(
-                prompt=prompt,
-                model_name=model_name, # <-- Используем общую модель
-                first_frame_image_path=first_frame_path,
-                end_image_path=end_frame_path
+    # --- Параллельная обработка запросов --- #
+    futures = []
+    # Используем ThreadPoolExecutor для I/O-bound задач (ожидание API, скачивание)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+        logger.info(f"Отправка {len(valid_requests_with_indices)} валидных запросов в ThreadPoolExecutor...")
+        for req_data, req_index in valid_requests_with_indices:
+            # Отправляем задачу на выполнение в потоке
+            future = executor.submit(
+                _process_single_video_request,
+                req_data,         # Данные запроса
+                req_index,        # Номер запроса
+                model_name,       # Общее имя модели
+                save_directory    # Общая папка сохранения
             )
+            futures.append(future)
 
-            if not isinstance(api_result, str) or not api_result.startswith("http"):
-                error_message = f"Ошибка API Replicate для запроса {request_index}: {api_result}"
-                logger.error(error_message)
-                results.append(error_message)
-                error_count += 1
-                continue
-
-            video_url = api_result
-            logger.info(f"  Запрос {request_index}: получен URL видео: {video_url}")
-
-            # --- Скачивание и сохранение ---
-            # Формируем имя файла: используем указанное или генерируем
-            if output_filename_base:
-                # Убираем возможное расширение, если пользователь его добавил
-                if '.' in output_filename_base:
-                    output_filename_base = os.path.splitext(output_filename_base)[0]
-                filename = f"{output_filename_base}.mp4"
-            else:
-                # Генерируем имя, если оно не указано
-                filename = f"video_{request_index}_{uuid.uuid4().hex[:6]}.mp4"
-
-            # filename = f"{base_filename_prefix}_{request_index}_{uuid.uuid4().hex[:6]}.mp4"
-            save_path = save_directory / filename
-            logger.debug(f"  Запрос {request_index}: скачивание видео в {save_path}...")
-
-            if download_file(video_url, save_path):
-                saved_file_path = str(save_path)
-                logger.info(f"  Запрос {request_index}: видео успешно сохранено: {saved_file_path}")
-                results.append(saved_file_path)
-                processed_count += 1
-                _try_open_file(save_path) # Попытка открыть
-            else:
-                error_msg = f"Ошибка скачивания для запроса {request_index}."
-                logger.error(error_msg)
+        logger.info("Ожидание завершения обработки запросов...")
+        # Собираем результаты по мере завершения
+        for future in concurrent.futures.as_completed(futures):
+            try:
+                result = future.result() # Получаем результат из потока (путь или строка ошибки)
+                results.append(result)
+                # Обновляем счетчики на основе результата
+                if isinstance(result, str) and result.startswith(("Ошибка", "Неожиданная")):
+                    error_count += 1
+                else:
+                    # Предполагаем, что строка без 'Ошибка' - это путь к файлу
+                    processed_count += 1
+            except Exception as e:
+                # Если сама future завершилась с необработанным исключением (не должно происходить из-за try/except в _process_single_video_request)
+                error_msg = f"Критическая ошибка при получении результата из потока: {e}"
+                logger.exception(error_msg)
                 results.append(error_msg)
                 error_count += 1
 
-        except Exception as e:
-            error_msg = f"Неожиданная ошибка при обработке запроса {request_index}: {e}"
-            logger.exception(error_msg)
-            results.append(error_msg)
-            error_count += 1
-
     logger.info(
-        f"generate_and_save_multiple_videos завершен. "
+        f"generate_and_save_multiple_videos (ПАРАЛЛЕЛЬНО) завершен. "
         f"Успешно обработано: {processed_count}, с ошибками: {error_count}."
     )
     return results
+
+# --- Вспомогательная функция для параллельной обработки ИЗОБРАЖЕНИЙ ---
+def _process_single_image_request(request_data: dict, request_index: int, save_directory: Path) -> list[str] | str:
+    """
+    Обрабатывает один запрос на генерацию изображений (возможно, нескольких).
+    Вызывается в отдельном потоке.
+
+    Args:
+        request_data: Словарь с данными запроса ('prompt', 'num_outputs', ...).
+        request_index: Порядковый номер запроса (для логирования и имен файлов).
+        save_directory: Путь к директории для сохранения.
+
+    Returns:
+        Список строк с путями к сохраненным файлам или одна строка с сообщением об ошибке.
+    """
+    logger.info(f"Начало обработки запроса изображений {request_index} в потоке...")
+
+    # Извлечение параметров
+    prompt = request_data.get("prompt")
+    num_outputs = request_data.get("num_outputs", 1) # По умолчанию 1
+    aspect_ratio = request_data.get("aspect_ratio", DEFAULT_ASPECT_RATIO) # Используем дефолт
+    lora_hf_id = request_data.get("lora_hf_id")
+    lora_trigger_word = request_data.get("lora_trigger_word")
+    filename_prefix = request_data.get("output_filename_prefix", f"image_{request_index}") # Дефолтный префикс
+
+    # Проверки обязательных полей
+    if not prompt:
+         error_msg = f"Запрос {request_index}: Отсутствует обязательный ключ 'prompt'."
+         logger.error(error_msg)
+         return error_msg
+    if not isinstance(num_outputs, int) or num_outputs <= 0:
+        num_outputs = 1
+        logger.warning(f"Запрос {request_index}: Некорректное значение num_outputs, установлено в 1.")
+
+    logger.info(
+        f"  Запрос {request_index}: Параметры: prompt='{prompt[:30]}...', N={num_outputs}, AR={aspect_ratio}, "
+        f"lora='{lora_hf_id}', trigger='{lora_trigger_word}', prefix='{filename_prefix}'"
+    )
+
+    saved_files_for_request = []
+    try:
+        # --- Вызов API --- (Эта часть выполняется в потоке)
+        api_result = call_replicate_api(
+            prompt=prompt,
+            num_outputs=num_outputs,
+            aspect_ratio=aspect_ratio,
+            lora_hf_id=lora_hf_id,
+            lora_trigger_word=lora_trigger_word
+        )
+
+        # call_replicate_api возвращает список URL или строку ошибки
+        if isinstance(api_result, str):
+            error_message = f"Ошибка API Replicate для запроса изображений {request_index}: {api_result}"
+            logger.error(f"  {error_message}")
+            return error_message # Возвращаем ошибку из потока
+
+        output_urls = api_result
+        logger.info(f"  Запрос {request_index}: получено {len(output_urls)} URL изображений.")
+
+        # --- Скачивание и сохранение каждого изображения --- (Эта часть тоже выполняется в потоке)
+        opened_files_count = 0
+        download_errors = 0
+        for i, url in enumerate(output_urls):
+            if len(output_urls) > 1:
+                filename = f"{filename_prefix}_{i+1}.png"
+            else:
+                filename = f"{filename_prefix}.png"
+
+            save_path = save_directory / filename
+            logger.debug(f"  Запрос {request_index}, Изображение {i+1}: скачивание {url} в {save_path}...")
+
+            if download_file(url, save_path):
+                saved_file_path = str(save_path)
+                logger.info(f"  Запрос {request_index}, Изображение {i+1}: успешно сохранено: {saved_file_path}")
+                saved_files_for_request.append(saved_file_path)
+                if _try_open_file(save_path):
+                    opened_files_count += 1
+            else:
+                logger.error(f"  Запрос {request_index}, Изображение {i+1}: ошибка скачивания URL: {url}")
+                download_errors += 1
+
+        if download_errors > 0:
+             # Если были ошибки скачивания, но хотя бы что-то скачалось, вернем пути
+             # Если ничего не скачалось, вернем общую ошибку
+             if not saved_files_for_request:
+                 return f"Ошибка скачивания всех изображений для запроса {request_index}."
+             else:
+                 logger.warning(f"Запрос {request_index}: Были ошибки при скачивании {download_errors} изображений.")
+
+        if opened_files_count > 0:
+             logger.info(f"  Запрос {request_index}: Предпринята попытка открыть {opened_files_count} файлов.")
+
+        logger.info(f"Обработка запроса изображений {request_index} в потоке завершена. Сохранено: {len(saved_files_for_request)}.")
+        return saved_files_for_request # Возвращаем список путей
+
+    except Exception as e:
+        error_msg = f"Неожиданная ошибка при обработке запроса изображений {request_index} в потоке: {e}"
+        logger.exception(f"  {error_msg}") # Логируем с трассировкой
+        return error_msg # Возвращаем неожиданную ошибку из потока
+
+# --- НОВЫЙ Инструмент MCP для Нескольких ИЗОБРАЖЕНИЙ (Параллельный) ---
+@mcp.tool()
+def generate_and_save_multiple_images(
+    image_requests: list[dict],
+    base_output_dir: str,
+    max_workers: int = 8 # <-- Макс. кол-во параллельных потоков
+) -> list[str]:
+    """
+    Генерирует НЕСКОЛЬКО наборов изображений ПАРАЛЛЕЛЬНО с помощью Replicate
+    на основе списка запросов, сохраняет их в базовую директорию и пытается открыть.
+    Возвращает плоский список путей ко всем успешно сохраненным файлам и/или сообщения об ошибках.
+
+    Args:
+        image_requests: Список словарей. Каждый словарь представляет один запрос
+                        и должен содержать ключи:
+                        - 'prompt' (str): Текстовый промпт для генерации.
+                        Опциональные ключи:
+                        - 'num_outputs' (int): Количество изображений (по умолчанию 1).
+                        - 'aspect_ratio' (str): Соотношение сторон (по умолчанию DEFAULT_ASPECT_RATIO).
+                        - 'lora_hf_id' (str): Идентификатор LoRA.
+                        - 'lora_trigger_word' (str): Ключевое слово LoRA.
+                        - 'output_filename_prefix' (str): Префикс для имен файлов этого запроса
+                                                          (по умолчанию "image_<request_index>").
+        base_output_dir: Абсолютный путь к базовой папке для сохранения всех изображений.
+        max_workers: Максимальное количество потоков для параллельной обработки (по умолчанию 8).
+
+    Returns:
+        Плоский список строк: содержит пути ко ВСЕМ успешно сохраненным файлам
+        из ВСЕХ запросов и/или сообщения об ошибках для каждого запроса.
+    """
+    logger.info(
+        f"Вызов generate_and_save_multiple_images (ПАРАЛЛЕЛЬНО, max_workers={max_workers}): "
+        f"{len(image_requests)} запросов, base_dir='{base_output_dir}'"
+    )
+
+    all_results = [] # Собираем ВСЕ результаты (пути и ошибки)
+    processed_files_count = 0
+    error_requests_count = 0
+
+    # --- Валидация входных данных ---
+    if not isinstance(image_requests, list):
+        error_msg = "Ошибка: 'image_requests' должен быть списком."
+        logger.error(error_msg)
+        return [error_msg]
+    if not base_output_dir:
+        error_msg = "Ошибка: 'base_output_dir' не может быть пустым."
+        logger.error(error_msg)
+        return [error_msg]
+
+    # --- Предварительная проверка запросов ---
+    valid_requests_with_indices = []
+    for i, req_data in enumerate(image_requests):
+        request_index = i + 1
+        if not isinstance(req_data, dict):
+            error_msg = f"Ошибка запроса {request_index}: Элемент в 'image_requests' должен быть словарем."
+            logger.error(error_msg)
+            all_results.append(error_msg)
+            error_requests_count += 1
+            continue
+        prompt = req_data.get("prompt")
+        if not prompt:
+            error_msg = f"Ошибка запроса {request_index}: Отсутствует обязательный ключ 'prompt'."
+            logger.error(error_msg)
+            all_results.append(error_msg)
+            error_requests_count += 1
+            continue
+        valid_requests_with_indices.append((req_data, request_index))
+
+    if not valid_requests_with_indices:
+        logger.warning("Нет валидных запросов изображений для обработки.")
+        return all_results if all_results else ["Нет валидных запросов изображений для обработки."]
+
+    # --- Создание базовой директории ---
+    try:
+        save_directory = Path(base_output_dir)
+        save_directory.mkdir(parents=True, exist_ok=True)
+        logger.debug(f"Базовая директория для сохранения изображений: {save_directory.resolve()}")
+    except OSError as e:
+        error_msg = f"Ошибка создания базовой директории {save_directory}: {e}"
+        logger.exception(error_msg)
+        all_results.insert(0, error_msg)
+        return all_results
+    except Exception as e:
+        error_msg = f"Неожиданная ошибка при создании директории {base_output_dir}: {e}"
+        logger.exception(error_msg)
+        all_results.insert(0, error_msg)
+        return all_results
+
+    # --- Параллельная обработка запросов --- #
+    futures = []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+        logger.info(f"Отправка {len(valid_requests_with_indices)} валидных запросов изображений в ThreadPoolExecutor...")
+        for req_data, req_index in valid_requests_with_indices:
+            future = executor.submit(
+                _process_single_image_request,
+                req_data,
+                req_index,
+                save_directory
+            )
+            futures.append(future)
+
+        logger.info("Ожидание завершения обработки запросов изображений...")
+        for future in concurrent.futures.as_completed(futures):
+            try:
+                result = future.result() # Получаем результат (список путей или строка ошибки)
+                if isinstance(result, list):
+                    all_results.extend(result) # Добавляем список путей
+                    processed_files_count += len(result)
+                elif isinstance(result, str):
+                    all_results.append(result) # Добавляем строку ошибки
+                    error_requests_count += 1
+                else:
+                    # Неожиданный тип результата
+                    error_msg = f"Неожиданный тип результата из потока обработки изображений: {type(result)}"
+                    logger.error(error_msg)
+                    all_results.append(error_msg)
+                    error_requests_count += 1
+            except Exception as e:
+                error_msg = f"Критическая ошибка при получении результата из потока изображений: {e}"
+                logger.exception(error_msg)
+                all_results.append(error_msg)
+                error_requests_count += 1
+
+    logger.info(
+        f"generate_and_save_multiple_images (ПАРАЛЛЕЛЬНО) завершен. "
+        f"Всего сохранено файлов: {processed_files_count}, запросов с ошибками: {error_requests_count}."
+    )
+    return all_results
 
 # --- Убираем блок запуска сервера ---
 # import asyncio # Больше не нужен

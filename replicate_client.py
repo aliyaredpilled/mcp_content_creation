@@ -48,7 +48,8 @@ def call_replicate_api(
          logger.warning(f"Указан lora_hf_id, но lora_trigger_word '{lora_trigger_word}' не найден в промпте.")
 
     try:
-        client = replicate.Client(api_token=REPLICATE_API_KEY)
+        # Устанавливаем таймаут в 600 секунд (10 минут)
+        client = replicate.Client(api_token=REPLICATE_API_KEY, timeout=600)
 
         input_params = {
             "prompt": prompt,
@@ -159,7 +160,8 @@ def call_replicate_video_api(
 
 
     try:
-        client = replicate.Client(api_token=REPLICATE_API_KEY)
+        # Устанавливаем таймаут в 600 секунд (10 минут)
+        client = replicate.Client(api_token=REPLICATE_API_KEY, timeout=600)
         _model_id_to_use = None
         input_params = {"prompt": prompt}
         log_params_info = [] # Собираем инфо о параметрах для лога
