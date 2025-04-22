@@ -3,6 +3,10 @@ import traceback
 from dotenv import load_dotenv
 from elevenlabs.client import ElevenLabs
 from elevenlabs.core import ApiError
+import logging
+
+# Получаем логгер для этого модуля
+logger = logging.getLogger(__name__)
 
 # Загрузка API ключа из .env
 load_dotenv()
@@ -15,7 +19,7 @@ DEFAULT_OUTPUT_FORMAT = "mp3_44100_128"
 # ----------------------------- #
 
 if not ELEVENLABS_API_KEY:
-    print("Предупреждение: Ключ ELEVENLABS_API_KEY не найден. Запросы к ElevenLabs API не будут работать.")
+    logger.warning("Ключ ELEVENLABS_API_KEY не найден. Запросы к ElevenLabs API не будут работать.")
 
 def call_elevenlabs_tts_api(
     text: str,
@@ -35,7 +39,9 @@ def call_elevenlabs_tts_api(
     Returns:
         Байты сгенерированного аудиофайла или строка с сообщением об ошибке.
     """
+    logger.debug(f"Вызов call_elevenlabs_tts_api с voice='{voice_id}', model='{model_id}'")
     if not ELEVENLABS_API_KEY:
+        logger.error("ELEVENLABS_API_KEY не настроен.")
         return "Ошибка: ELEVENLABS_API_KEY не настроен."
 
     # Используем значения по умолчанию из констант, если аргументы None
@@ -46,7 +52,7 @@ def call_elevenlabs_tts_api(
         # print(f"Инициализация клиента ElevenLabs...") # Убрал
         client = ElevenLabs(api_key=ELEVENLABS_API_KEY)
 
-        print(f"Запрос ElevenLabs TTS: Voice={actual_voice_id}, Model={actual_model_id}, Format={output_format}, Text: '{text[:60]}...'")
+        logger.info(f"Запрос ElevenLabs TTS: Voice={actual_voice_id}, Model={actual_model_id}, Format={output_format}, Text: '{text[:60]}...'")
 
         # Вызов API для генерации аудио
         audio_result = client.text_to_speech.convert(
@@ -62,32 +68,31 @@ def call_elevenlabs_tts_api(
             audio_bytes = audio_result
         elif hasattr(audio_result, '__iter__') and not isinstance(audio_result, (str, bytes)):
             # print("API вернул генератор, собираем байты...") # Убрал
+            logger.debug("API ElevenLabs вернул генератор, собираем байты...")
             for chunk in audio_result:
                 if isinstance(chunk, bytes):
                     audio_bytes += chunk
                 else:
                     error_message = f"Ошибка: Генератор ElevenLabs содержит не байты, а {type(chunk)}"
-                    print(error_message)
-                    return error_message
+                    logger.error(error_message)
+                    return f"Ошибка: {error_message}"
             if not audio_bytes:
                  error_message = "Ошибка: Генератор ElevenLabs не вернул байтов."
-                 print(error_message)
-                 return error_message
+                 logger.error(error_message)
+                 return f"Ошибка: {error_message}"
         else:
             error_message = f"Ошибка: ElevenLabs API вернул неожиданный тип: {type(audio_result)}"
-            print(error_message)
-            return error_message
+            logger.error(error_message)
+            return f"Ошибка: {error_message}"
         # --------------------------------------------------------------
 
-        print(f"ElevenLabs API успешно вернул {len(audio_bytes)} байт аудио.")
+        logger.info(f"ElevenLabs API успешно вернул {len(audio_bytes)} байт аудио.")
         return audio_bytes
 
     except ApiError as e:
         error_message = f"Ошибка API ElevenLabs: {e.status_code} - {e.message}"
-        print(error_message)
+        logger.error(error_message)
         return error_message
     except Exception as e:
-        error_message = f"Непредвиденная ошибка при вызове API ElevenLabs: {e}"
-        print(error_message)
-        traceback.print_exc()
-        return error_message 
+        logger.exception("Непредвиденная ошибка при вызове API ElevenLabs")
+        return "Непредвиденная ошибка при вызове API ElevenLabs" 

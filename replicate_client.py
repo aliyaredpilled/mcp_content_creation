@@ -2,6 +2,10 @@ import os
 import replicate
 import traceback
 from dotenv import load_dotenv
+import logging
+
+# Получаем логгер для этого модуля
+logger = logging.getLogger(__name__)
 
 # --- Константы и Настройки ---
 MODEL_ID = "lucataco/flux-schnell-lora:2a6b576af31790b470f0a8442e1e9791213fa13799cbb65a9fc1436e96389574"
@@ -12,7 +16,7 @@ load_dotenv()
 REPLICATE_API_KEY = os.getenv("REPLICATE_API_TOKEN")
 
 if not REPLICATE_API_KEY:
-    print("Предупреждение: Ключ REPLICATE_API_TOKEN не найден. Запросы к Replicate API не будут работать.")
+    logger.warning("Ключ REPLICATE_API_TOKEN не найден. Запросы к Replicate API не будут работать.")
 
 def call_replicate_api(
     prompt: str,
@@ -34,11 +38,13 @@ def call_replicate_api(
     Returns:
         Список URL-адресов сгенерированных изображений или строка с сообщением об ошибке.
     """
+    logger.debug(f"Вызов call_replicate_api с lora='{lora_hf_id}'")
     if not REPLICATE_API_KEY:
+        logger.error("REPLICATE_API_TOKEN не настроен.")
         return "Ошибка: REPLICATE_API_TOKEN не настроен."
 
     if lora_hf_id and lora_trigger_word and lora_trigger_word not in prompt:
-         print(f"Предупреждение: Указан lora_hf_id, но lora_trigger_word '{lora_trigger_word}' не найден в промпте.")
+         logger.warning(f"Указан lora_hf_id, но lora_trigger_word '{lora_trigger_word}' не найден в промпте.")
 
     try:
         client = replicate.Client(api_token=REPLICATE_API_KEY)
@@ -55,27 +61,25 @@ def call_replicate_api(
         else:
             lora_info = ""
 
-        print(f"Запрос Replicate ({MODEL_ID.split(':')[0]}): N={num_outputs}, AR={aspect_ratio}{lora_info}, Prompt: '{prompt[:60]}...'" )
+        logger.info(f"Запрос Replicate ({MODEL_ID.split(':')[0]}): N={num_outputs}, AR={aspect_ratio}{lora_info}, Prompt: '{prompt[:60]}...'" )
 
         output = client.run(MODEL_ID, input=input_params)
 
         if not isinstance(output, list):
-            error_message = f"Ошибка: Replicate API вернул не список URL: {type(output)}"
-            print(error_message)
-            return error_message
+            error_message = f"Replicate API вернул не список URL: {type(output)}"
+            logger.error(error_message)
+            return f"Ошибка: {error_message}"
 
-        print(f"Replicate вернул {len(output)} URL.")
+        logger.info(f"Replicate API вернул {len(output)} URL.")
         return output
 
     except replicate.exceptions.ReplicateError as e:
         error_message = f"Ошибка API Replicate: {e}"
-        print(error_message)
+        logger.error(error_message)
         return error_message
     except Exception as e:
-        error_message = f"Непредвиденная ошибка при вызове Replicate API: {e}"
-        print(error_message)
-        traceback.print_exc()
-        return error_message
+        logger.exception("Непредвиденная ошибка при вызове Replicate API изображений")
+        return "Непредвиденная ошибка при вызове Replicate API изображений"
 
 def call_replicate_video_api(
     prompt: str,
@@ -92,23 +96,25 @@ def call_replicate_video_api(
     Returns:
         URL сгенерированного видео или строка с сообщением об ошибке.
     """
+    logger.debug(f"Вызов call_replicate_video_api с frame='{first_frame_image_path}'")
     if not REPLICATE_API_KEY:
+        logger.error("REPLICATE_API_TOKEN не настроен.")
         return "Ошибка: REPLICATE_API_TOKEN не настроен."
 
     image_file_content = None
     image_info = "Нет"
     if first_frame_image_path:
         if not os.path.exists(first_frame_image_path):
-            error_message = f"Ошибка: Файл первого кадра не найден: {first_frame_image_path}"
-            print(error_message)
-            return error_message
+            error_message = f"Файл первого кадра не найден: {first_frame_image_path}"
+            logger.error(error_message)
+            return f"Ошибка: {error_message}"
         try:
+            logger.debug(f"Открытие файла первого кадра: {first_frame_image_path}")
             image_file_content = open(first_frame_image_path, "rb")
             image_info = first_frame_image_path
         except Exception as e:
-            error_message = f"Ошибка при открытии файла {first_frame_image_path}: {e}"
-            print(error_message)
-            return error_message
+            logger.exception(f"Ошибка при открытии файла {first_frame_image_path}")
+            return f"Ошибка при открытии файла {first_frame_image_path}"
 
     try:
         client = replicate.Client(api_token=REPLICATE_API_KEY)
@@ -121,7 +127,7 @@ def call_replicate_video_api(
         if image_file_content:
             input_params["first_frame_image"] = image_file_content
 
-        print(f"Запрос Replicate Video ({VIDEO_MODEL_ID}): Кадр={image_info}, PromptOpt=True, Prompt: '{prompt[:60]}...'" )
+        logger.info(f"Запрос Replicate Video ({VIDEO_MODEL_ID}): Кадр={image_info}, PromptOpt=True, Prompt: '{prompt[:60]}...'" )
 
         if image_file_content:
             with image_file_content:
@@ -130,29 +136,30 @@ def call_replicate_video_api(
             output_url = client.run(VIDEO_MODEL_ID, input=input_params)
 
         if not isinstance(output_url, str):
-            error_message = f"Ошибка: Replicate API вернул не URL для видео: {type(output_url)}"
-            print(error_message)
+            error_message = f"Replicate API вернул не URL для видео: {type(output_url)}"
+            logger.error(error_message)
+            # Попробуем извлечь URL, если это список с одним элементом
             if isinstance(output_url, list) and len(output_url) == 1 and isinstance(output_url[0], str):
-                print("Предполагаем, что первый элемент списка - это URL.")
+                logger.warning("Replicate API вернул список, предполагаем, что первый элемент списка - это URL.")
                 output_url = output_url[0]
             else:
-                return error_message
+                return f"Ошибка: {error_message}"
 
-        print(f"Replicate вернул URL видео: {output_url}")
+        logger.info(f"Replicate API вернул URL видео: {output_url}")
         return output_url
 
     except replicate.exceptions.ReplicateError as e:
         error_message = f"Ошибка API Replicate (видео): {e}"
-        print(error_message)
+        logger.error(error_message)
         return error_message
     except Exception as e:
-        error_message = f"Непредвиденная ошибка при вызове Replicate API (видео): {e}"
-        print(error_message)
-        traceback.print_exc()
-        return error_message
+        logger.exception("Непредвиденная ошибка при вызове Replicate API (видео)")
+        return "Непредвиденная ошибка при вызове Replicate API (видео)"
     finally:
+        # Гарантированное закрытие файла, если он был открыт и не использовался в with
         if image_file_content and not image_file_content.closed:
              try:
+                 logger.debug(f"Закрытие файла {first_frame_image_path} в блоке finally.")
                  image_file_content.close()
              except Exception as close_err:
-                 print(f"Ошибка при закрытии файла {first_frame_image_path} в finally: {close_err}") 
+                 logger.error(f"Ошибка при закрытии файла {first_frame_image_path} в finally: {close_err}") 
