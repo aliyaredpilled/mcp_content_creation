@@ -10,10 +10,14 @@ from mcp.server.fastmcp import FastMCP
 # Возвращаем импорты инструментов
 from replicate_client import call_replicate_api, call_replicate_video_api # <--- Импортируем новую функцию
 from elevenlabs_client import call_elevenlabs_tts_api, DEFAULT_OUTPUT_FORMAT # <--- Импорт новой функции и константы
+from openai_client import get_openai_client, call_openai_image_api # <--- Импорт новых функций OpenAI
 import traceback # Добавляем импорт traceback сюда, т.к. он используется в блоке except
 import logging
 import sys # Для вывода в stderr
 import concurrent.futures # <--- Добавляем импорт
+import base64 # <--- Добавляем импорт для OpenAI
+from typing import Optional, List
+from openai import OpenAI
 
 # --- Настройка базового логгера ---
 log_format = '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
@@ -488,7 +492,7 @@ def generate_and_save_multiple_videos(
         prompt = req_data.get("prompt")
         first_frame_path = req_data.get("first_frame_image_path")
         if not prompt or not first_frame_path:
-            error_msg = f"Ошибка запроса {request_index}: Отсутствуют обязательные ключи 'prompt' или 'first_frame_image_path'."
+            error_msg = f"Ошибка запроса {request_index}: Отсутствуют обязательные ключи 'prompt' или 'first_frame_path'."
             logger.error(error_msg)
             results.append(error_msg)
             error_count += 1
@@ -782,6 +786,330 @@ def generate_and_save_multiple_images(
 
     logger.info(
         f"generate_and_save_multiple_images (ПАРАЛЛЕЛЬНО) завершен. "
+        f"Всего сохранено файлов: {processed_files_count}, запросов с ошибками: {error_requests_count}."
+    )
+    return all_results
+
+# --- Вспомогательная функция для сохранения байтов --- (для OpenAI)
+def save_image_bytes(image_bytes: bytes, save_path: Path) -> bool:
+    """Сохраняет байты изображения в файл."""
+    try:
+        logger.debug(f"Начало сохранения {len(image_bytes)} байт в {save_path}")
+        with open(save_path, "wb") as f:
+            f.write(image_bytes)
+        logger.info(f"Файл сохранен: {save_path}")
+        return True
+    except Exception as e:
+        logger.exception(f"Неожиданная ошибка сохранения файла {save_path}")
+        return False
+
+# --- Вспомогательная функция для параллельной обработки OpenAI ИЗОБРАЖЕНИЙ --- (Должна быть здесь)
+def _process_single_openai_image_request(
+    client: OpenAI, # Передаем готовый клиент
+    request_data: dict,
+    request_index: int,
+    save_directory: Path
+) -> list[str] | str:
+    """
+    Обрабатывает один запрос на генерацию/редактирование OpenAI изображений.
+    Вызывается в отдельном потоке.
+    Если режим - редактирование и num_outputs > 1, выполняет num_outputs параллельных запросов.
+
+    Args:
+        client: Инициализированный клиент OpenAI.
+        request_data: Словарь с данными запроса ('prompt', 'num_outputs', 'reference_image_paths'...).
+        request_index: Порядковый номер запроса.
+        save_directory: Путь к директории для сохранения.
+
+    Returns:
+        Список строк с путями к сохраненным файлам или одна строка с сообщением об ошибке.
+    """
+    logger.info(f"Начало обработки OpenAI запроса {request_index} в потоке...")
+
+    # Извлечение параметров
+    prompt = request_data.get("prompt")
+    num_outputs = request_data.get("num_outputs", 1)
+    size = request_data.get("size", "1024x1536") # Используем портретный по умолчанию
+    quality = request_data.get("quality", "medium")
+    reference_image_paths = request_data.get("reference_image_paths") # Может быть None
+    filename_prefix = request_data.get("output_filename_prefix", f"openai_image_{request_index}")
+
+    if not prompt:
+         error_msg = f"OpenAI Запрос {request_index}: Отсутствует обязательный ключ 'prompt'."
+         logger.error(error_msg)
+         return error_msg
+
+    is_editing_mode = bool(reference_image_paths)
+    mode = "редактирования" if is_editing_mode else "генерации"
+    logger.info(
+        f"  OpenAI Запрос {request_index} (режим {mode}): Параметры: prompt='{prompt[:30]}...', "
+        f"N={num_outputs}, Size={size}, Quality={quality}, Refs={len(reference_image_paths) if reference_image_paths else 0}, "
+        f"Prefix='{filename_prefix}'"
+    )
+
+    all_saved_files_for_request = []
+    all_api_results_base64 = [] # Собираем base64 данные или ошибки
+    processing_errors = [] # Собираем ошибки обработки (сохранение, декодирование)
+
+    try:
+        # --- Вызов API ---
+        # Если режим редактирования и нужно > 1 результата, делаем параллельные вызовы
+        if is_editing_mode and num_outputs > 1:
+            logger.info(f"  OpenAI Запрос {request_index}: Запуск {num_outputs} параллельных запросов на редактирование...")
+            edit_futures = []
+            # Используем вложенный ThreadPoolExecutor для параллельных API вызовов *внутри* одного запроса
+            # max_workers можно ограничить, чтобы не перегружать API/сеть
+            with concurrent.futures.ThreadPoolExecutor(max_workers=min(num_outputs, 4)) as edit_executor:
+                for i in range(num_outputs):
+                    # Каждый вызов делается с n=1 (в call_openai_image_api это учтено)
+                    future = edit_executor.submit(
+                        call_openai_image_api,
+                        client=client,
+                        prompt=prompt,
+                        n=1, # Важно: n=1 для каждого вызова редактирования
+                        size=size,
+                        quality=quality,
+                        reference_image_paths=reference_image_paths
+                    )
+                    edit_futures.append(future)
+
+                # Собираем результаты параллельных вызовов
+                for i, future in enumerate(concurrent.futures.as_completed(edit_futures)):
+                    try:
+                        result = future.result() # Список base64 (обычно 1) или строка ошибки
+                        if isinstance(result, list) and result:
+                            all_api_results_base64.append(result[0]) # Берем первый (и единственный) элемент
+                        elif isinstance(result, str):
+                            logger.error(f"  OpenAI Запрос {request_index}, Вызов {i+1}: Ошибка API: {result}")
+                            # Добавляем ошибку, чтобы сообщить пользователю
+                            processing_errors.append(f"Ошибка API при редактировании (вызов {i+1}): {result}")
+                        else:
+                            logger.error(f"  OpenAI Запрос {request_index}, Вызов {i+1}: Неожиданный результат API: {result}")
+                            processing_errors.append(f"Неожиданный результат API при редактировании (вызов {i+1})")
+                    except Exception as e:
+                        logger.exception(f"  OpenAI Запрос {request_index}, Вызов {i+1}: Исключение при получении результата из потока редактирования")
+                        processing_errors.append(f"Ошибка при получении результата редактирования (вызов {i+1}): {e}")
+
+            logger.info(f"  OpenAI Запрос {request_index}: Завершено {num_outputs} параллельных запросов на редактирование. Получено результатов/ошибок: {len(all_api_results_base64)}/{len(processing_errors)}")
+
+        # Иначе (генерация или редактирование с num_outputs=1), делаем один вызов
+        else:
+            api_result = call_openai_image_api(
+                client=client,
+                prompt=prompt,
+                n=num_outputs if not is_editing_mode else 1, # n=1 для одного редактирования
+                size=size,
+                quality=quality,
+                reference_image_paths=reference_image_paths
+            )
+
+            if isinstance(api_result, str): # Ошибка API
+                error_message = f"Ошибка OpenAI API для запроса {request_index}: {api_result}"
+                logger.error(f"  {error_message}")
+                return error_message # Возвращаем сразу, если основной вызов не удался
+            else:
+                all_api_results_base64 = api_result # Список base64 строк
+
+        logger.info(f"  OpenAI Запрос {request_index}: получено {len(all_api_results_base64)} base64 строк для сохранения.")
+
+        # --- Декодирование, сохранение и открытие --- (Общее для всех режимов)
+        opened_files_count = 0
+        decode_errors = 0
+        save_errors = 0
+
+        for i, b64_data in enumerate(all_api_results_base64):
+            unique_id = uuid.uuid4().hex[:6]
+            # Нумеруем файлы последовательно, даже если они от разных API вызовов
+            filename = f"{filename_prefix}_{i+1}_{unique_id}.png"
+            save_path = save_directory / filename
+
+            # Декодирование
+            try:
+                logger.debug(f"  Запрос {request_index}, Изобр. {i+1}: Декодирование base64...")
+                image_bytes = base64.b64decode(b64_data)
+            except (base64.binascii.Error, ValueError) as decode_err:
+                logger.error(f"  Запрос {request_index}, Изобр. {i+1}: Ошибка декодирования base64: {decode_err}")
+                decode_errors += 1
+                processing_errors.append(f"Ошибка декодирования изобр. {i+1}")
+                continue
+
+            # Сохранение
+            logger.debug(f"  Запрос {request_index}, Изобр. {i+1}: Сохранение в {save_path}...")
+            if save_image_bytes(image_bytes, save_path):
+                saved_file_path = str(save_path)
+                logger.info(f"  Запрос {request_index}, Изобр. {i+1}: Успешно сохранено: {saved_file_path}")
+                all_saved_files_for_request.append(saved_file_path)
+                if _try_open_file(save_path):
+                    opened_files_count += 1
+            else:
+                 logger.error(f"  Запрос {request_index}, Изобр. {i+1}: Ошибка сохранения файла.")
+                 save_errors += 1
+                 processing_errors.append(f"Ошибка сохранения изобр. {i+1}")
+
+        # --- Обработка ошибок и финальный результат ---
+        if decode_errors > 0:
+             logger.warning(f"  Запрос {request_index}: Было {decode_errors} ошибок декодирования.")
+        if save_errors > 0:
+             logger.warning(f"  Запрос {request_index}: Было {save_errors} ошибок сохранения.")
+        if opened_files_count > 0:
+             logger.info(f"  Запрос {request_index}: Предпринята попытка открыть {opened_files_count} файлов.")
+
+        # Собираем финальный результат: сначала пути, потом ошибки обработки/API
+        final_result = all_saved_files_for_request + processing_errors
+
+        logger.info(f"Обработка OpenAI запроса {request_index} в потоке завершена. Сохранено: {len(all_saved_files_for_request)}. Ошибок обработки/API: {len(processing_errors)}.")
+
+        if not final_result:
+             # Если нет ни путей, ни ошибок (например, API вернул пустой список)
+             return f"Замечание: Для OpenAI запроса {request_index} не было получено или сохранено изображений."
+        else:
+             return final_result # Возвращаем список путей и/или строк ошибок
+
+    except Exception as e:
+        error_msg = f"Неожиданная ошибка при обработке OpenAI запроса {request_index} в потоке: {e}"
+        logger.exception(f"  {error_msg}")
+        # Возвращаем ошибку + все, что успели сохранить до этого
+        return all_saved_files_for_request + [error_msg]
+
+# --- Инструмент MCP для Нескольких OpenAI ИЗОБРАЖЕНИЙ (Параллельный) ---
+@mcp.tool()
+def generate_and_save_multiple_openai_images(
+    image_requests: list[dict],
+    base_output_dir: str,
+    max_workers: int = 8
+) -> list[str]:
+    """
+    Генерирует или редактирует НЕСКОЛЬКО наборов изображений ПАРАЛЛЕЛЬНО с помощью OpenAI (gpt-image-1)
+    на основе списка запросов, сохраняет их в базовую директорию и пытается открыть.
+    Возвращает плоский список путей ко всем успешно сохраненным файлам и/или сообщения об ошибках.
+
+    **Для генерации одного изображения:** передайте список `image_requests` с одним элементом.
+
+    Args:
+        image_requests: Список словарей. Каждый словарь представляет один запрос
+                        и должен содержать ключ 'prompt' (str).
+                        Опциональные ключи:
+                        - 'num_outputs' (int): Кол-во изображений (по умолч. 1, игнор. при ред.).
+                        - 'size' (str): Размер ('1024x1024', '1536x1024', '1024x1536', 'auto', по умолч. '1024x1536').
+                        - 'quality' (str): Качество ('low', 'medium', 'high', 'auto', по умолч. 'medium').
+                        - 'output_filename_prefix' (str): Префикс имен файлов (по умолч. "openai_image_<index>").
+                        - 'reference_image_paths' (list[str] | None): Список путей к референсам для режима редактирования.
+                          При использовании нескольких референсов, рекомендуется указывать в промпте, какой референс за что отвечает, используя их описания или концептуальные имена (например, "Generate the monster (Grizzya) in the artistic style of the cat image").
+        base_output_dir: Абсолютный путь к базовой папке для сохранения всех изображений.
+        max_workers: Максимальное количество потоков для параллельной обработки (по умолчанию 8).
+
+    Returns:
+        Плоский список строк: содержит пути ко ВСЕМ успешно сохраненным файлам
+        из ВСЕХ запросов и/или сообщения об ошибках для каждого запроса.
+    """
+    logger.info(
+        f"Вызов generate_and_save_multiple_openai_images (ПАРАЛЛЕЛЬНО, max_workers={max_workers}): "
+        f"{len(image_requests)} запросов, base_dir='{base_output_dir}'"
+    )
+
+    all_results = []
+    processed_files_count = 0
+    error_requests_count = 0
+
+    # --- Валидация --- #
+    if not isinstance(image_requests, list):
+        return ["Ошибка: 'image_requests' должен быть списком."]
+    if not base_output_dir:
+        return ["Ошибка: 'base_output_dir' не может быть пустым."]
+
+    # --- Инициализация клиента OpenAI (ОДИН РАЗ) --- #
+    logger.debug("Инициализация клиента OpenAI для параллельной обработки...")
+    client = get_openai_client()
+    if not client:
+        error_msg = "Ошибка: Не удалось инициализировать клиент OpenAI для параллельной обработки. Проверьте API ключ."
+        logger.error(error_msg)
+        return [error_msg]
+    logger.debug("Клиент OpenAI инициализирован.")
+
+    # --- Предварительная проверка запросов --- #
+    valid_requests_with_indices = []
+    for i, req_data in enumerate(image_requests):
+        request_index = i + 1
+        if not isinstance(req_data, dict):
+            error_msg = f"Ошибка OpenAI запроса {request_index}: Элемент в 'image_requests' должен быть словарем."
+            logger.error(error_msg)
+            all_results.append(error_msg)
+            error_requests_count += 1
+            continue
+        if not req_data.get("prompt"):
+            error_msg = f"Ошибка OpenAI запроса {request_index}: Отсутствует обязательный ключ 'prompt'."
+            logger.error(error_msg)
+            all_results.append(error_msg)
+            error_requests_count += 1
+            continue
+        # Доп. валидация reference_image_paths (проверка что это список строк, если есть)
+        refs = req_data.get("reference_image_paths")
+        if refs is not None and not (isinstance(refs, list) and all(isinstance(p, str) for p in refs)):
+             error_msg = f"Ошибка OpenAI запроса {request_index}: 'reference_image_paths' должен быть списком строк."
+             logger.error(error_msg)
+             all_results.append(error_msg)
+             error_requests_count += 1
+             continue
+
+        valid_requests_with_indices.append((req_data, request_index))
+
+    if not valid_requests_with_indices:
+        logger.warning("Нет валидных OpenAI запросов для обработки.")
+        return all_results if all_results else ["Нет валидных OpenAI запросов для обработки."]
+
+    # --- Создание базовой директории --- #
+    try:
+        save_directory = Path(base_output_dir)
+        save_directory.mkdir(parents=True, exist_ok=True)
+        logger.debug(f"Базовая директория для OpenAI изображений: {save_directory.resolve()}")
+    except OSError as e:
+        error_msg = f"Ошибка создания базовой директории {save_directory}: {e}"
+        logger.exception(error_msg)
+        all_results.insert(0, error_msg)
+        return all_results
+    except Exception as e:
+        error_msg = f"Неожиданная ошибка при создании директории {base_output_dir}: {e}"
+        logger.exception(error_msg)
+        all_results.insert(0, error_msg)
+        return all_results
+
+    # --- Параллельная обработка --- #
+    futures = []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+        logger.info(f"Отправка {len(valid_requests_with_indices)} валидных OpenAI запросов в ThreadPoolExecutor...")
+        for req_data, req_index in valid_requests_with_indices:
+            future = executor.submit(
+                _process_single_openai_image_request,
+                client, # Передаем КЛИЕНТ
+                req_data,
+                req_index,
+                save_directory
+            )
+            futures.append(future)
+
+        logger.info("Ожидание завершения обработки OpenAI запросов...")
+        for future in concurrent.futures.as_completed(futures):
+            try:
+                result = future.result() # Список путей или строка ошибки
+                if isinstance(result, list):
+                    all_results.extend(result)
+                    processed_files_count += len(result)
+                elif isinstance(result, str):
+                    all_results.append(result)
+                    error_requests_count += 1
+                else:
+                    error_msg = f"Неожиданный тип результата из потока OpenAI: {type(result)}"
+                    logger.error(error_msg)
+                    all_results.append(error_msg)
+                    error_requests_count += 1
+            except Exception as e:
+                error_msg = f"Критическая ошибка при получении результата из потока OpenAI: {e}"
+                logger.exception(error_msg)
+                all_results.append(error_msg)
+                error_requests_count += 1
+
+    logger.info(
+        f"generate_and_save_multiple_openai_images (ПАРАЛЛЕЛЬНО) завершен. "
         f"Всего сохранено файлов: {processed_files_count}, запросов с ошибками: {error_requests_count}."
     )
     return all_results

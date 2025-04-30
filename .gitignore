@@ -16,4 +16,10 @@ venv/
 mcp_server.log
 
 # Cursor config
-.cursor/ 
+.cursor/
+
+# macOS system file
+.DS_Store
+
+# Cursor settings file specific to this project
+.cursor-settings.json 

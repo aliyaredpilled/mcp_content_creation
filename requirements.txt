@@ -2,4 +2,5 @@ requests
 python-dotenv
 fastmcp
 replicate
-elevenlabs 
+elevenlabs
+openai 
