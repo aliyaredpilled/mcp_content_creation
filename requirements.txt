@@ -1,6 +1,6 @@
 requests
 python-dotenv
 fastmcp
-replicate
+fal-client
 elevenlabs
-openai 
+openai
