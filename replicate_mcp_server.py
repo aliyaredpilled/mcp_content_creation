@@ -19,6 +19,10 @@ import base64 # <--- Добавляем импорт для OpenAI
 from typing import Optional, List, Dict
 from openai import OpenAI
 
+# --- Глобальные переменные для размеров холста CapCut ---
+project_canvas_width = None
+project_canvas_height = None
+
 # --- Настройка базового логгера ---
 log_format = '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 # Изменяем уровень логирования на DEBUG для большей детализации
@@ -879,154 +883,95 @@ def _process_single_openai_image_request(
         # Возвращаем ошибку + все, что успели сохранить до этого
         return all_saved_files_for_request + [error_msg]
 
-
 @mcp.tool() # Раскомментируй для использования в MCP
 def create_capcut_project(
-    project_name: str,
-    media_items_info: List[Dict], 
-    default_fps: float = 30.0,
-    project_canvas_width: Optional[int] = None,
-    project_canvas_height: Optional[int] = None,
-    orientation: Optional[str] = None, # <--- ДОБАВЛЕН ПАРАМЕТР
-    logger = None # Принимаем логгер, как и раньше
+    project_name: str, media_items_info: List[Dict], default_fps: float = 30.0,
+    orientation: Optional[str] = None, logger = None
 ) -> List[str]:
     """
-    Создает проект CapCut на основе предоставленных медиафайлов и информации о таймлайне.
-    Пути к шаблону проекта и корневой папке проектов CapCut берутся из переменных окружения:
-    CAPCUT_TEMPLATE_PATH и CAPCUT_PROJECTS_ROOT.
+    Создаёт проект CapCut с заданным именем, медиа-элементами и параметрами.
 
     Args:
-        project_name: Имя нового проекта CapCut.
-        media_items_info: Список словарей. Каждый словарь описывает медиафайл
-                          для таймлайна и должен содержать:
-                          - 'path' (str): Путь к медиафайлу.
-                          - 'type' (str): 'video' или 'audio'.
-                          - 'timeline_start_ms' (int): Время начала на таймлайне (в мс).
-                          - 'timeline_duration_ms' (int): Длительность на таймлайне (в мс).
-                          - 'source_start_ms' (int): Время начала внутри исходного файла (в мс).
-                          - 'track_index' (int): Индекс дорожки (0, 1, ...).
-        default_fps: (Опционально) FPS проекта (по умолчанию 30.0).
-        project_canvas_width: (Опционально) Ширина холста проекта. 
-                              Игнорируется, если задан 'orientation'.
-        project_canvas_height: (Опционально) Высота холста проекта. 
-                               Игнорируется, если задан 'orientation'.
-        orientation: (Опционально) Ориентация холста ("vertical", "horizontal", "square"). 
-                     Имеет приоритет над project_canvas_width/height.
-
+        project_name (str): Имя создаваемого проекта CapCut.
+        media_items_info (List[Dict]): Список медиа-элементов (видео/аудио) для добавления в проект. Каждый элемент — словарь с ключами:
+            - 'path' (str): Абсолютный путь к файлу медиа.
+            - 'type' (str): Тип медиа ('video' или 'audio').
+            - 'timeline_start_ms' (int): Время старта на таймлайне (мс).
+            - 'timeline_duration_ms' (int): Длительность на таймлайне (мс).
+            - 'source_start_ms' (int): С какой позиции файла начинается вставка (мс).
+            - 'track_index' (int): Индекс дорожки (0 — первая).
+        default_fps (float, optional): Частота кадров проекта. По умолчанию 30.0.
+        orientation (str, optional): Ориентация проекта ('horizontal', 'vertical', 'portrait' и т.д.).
     Returns:
-        Список строк: Сообщение об успехе с путем к проекту или сообщение об ошибке.
+        List[str]: Список с одним сообщением об успехе (путь к проекту) или ошибке.
     """
-    # Настройка логгера, если не передан
     if logger is None:
-        import logging as pylogging 
-        import sys
-        logger = pylogging.getLogger("create_capcut_project_tool_mcp_local")
+        logger = logging.getLogger("create_capcut_project_tool_mcp_local")
         if not logger.hasHandlers():
-            handler = pylogging.StreamHandler(sys.stdout)
-            formatter = pylogging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-            handler.setFormatter(formatter)
-            logger.addHandler(handler)
-            logger.setLevel(pylogging.DEBUG)
+            handler = logging.StreamHandler(sys.stdout); 
+            handler.setFormatter(logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s'))
+            logger.addHandler(handler); logger.setLevel(logging.DEBUG)
 
-    base_template_project_path_str = os.environ.get("CAPCUT_TEMPLATE_PATH")
-    output_project_root_path_str = os.environ.get("CAPCUT_PROJECTS_ROOT")
+    # --- Определяем размеры холста по ориентации ---
+    if orientation:
+        orientation_lower = orientation.lower()
+        if orientation_lower == "vertical":
+            project_canvas_width, project_canvas_height = 1080, 1920
+        elif orientation_lower == "horizontal":
+            project_canvas_width, project_canvas_height = 1920, 1080
+        elif orientation_lower == "square":
+            project_canvas_width, project_canvas_height = 1080, 1080
+        else:
+            # Значения по умолчанию
+            project_canvas_width, project_canvas_height = 1080, 1920
+    else:
+        # Если ориентация не указана, используем вертикальное по умолчанию
+        project_canvas_width, project_canvas_height = 1080, 1920
 
-    logger.info(
-        f"Вызов create_capcut_project: project_name='{project_name}', "
-        f"media_items={len(media_items_info)}, fps={default_fps}, "
-        f"canvas_w={project_canvas_width}, canvas_h={project_canvas_height}, orientation='{orientation}'. " # Добавлен orientation в лог
-        f"ENV_TEMPLATE_PATH='{base_template_project_path_str}', ENV_PROJECTS_ROOT='{output_project_root_path_str}'"
-    )
+    base_template_path_str, output_root_path_str = os.environ.get("CAPCUT_TEMPLATE_PATH"), os.environ.get("CAPCUT_PROJECTS_ROOT")
+    logger.info(f"Вызов create_capcut_project: name='{project_name}', media={len(media_items_info)}, fps={default_fps}, canvas_w={project_canvas_width}, canvas_h={project_canvas_height}, orientation='{orientation}'. ENV_TEMPLATE='{base_template_path_str}', ENV_ROOT='{output_root_path_str}'")
 
-    # --- Валидация (остается такой же, как в твоем коде) ---
-    if not project_name:
-        logger.error("Ошибка валидации: 'project_name' не может быть пустым.")
-        return ["Ошибка: 'project_name' не может быть пустым."]
-    if not isinstance(media_items_info, list): # Проверка на тип list
-        logger.error("Ошибка валидации: 'media_items_info' должен быть списком.")
-        return ["Ошибка: 'media_items_info' должен быть списком."]
-    # Если media_items_info пустой, это может быть допустимо (создание пустого проекта)
-    # if not media_items_info: 
-    #     logger.warning("Предупреждение: 'media_items_info' пуст. Проект будет создан без медиа на таймлайне.")
-    
-    if not base_template_project_path_str:
-        logger.error("Ошибка валидации: Переменная окружения 'CAPCUT_TEMPLATE_PATH' не установлена или пуста.")
-        return ["Ошибка: Переменная окружения 'CAPCUT_TEMPLATE_PATH' не установлена или пуста."]
-    base_template_project_path = Path(base_template_project_path_str)
-    if not base_template_project_path.is_dir():
-        logger.error(f"Ошибка валидации: Путь к шаблону '{base_template_project_path_str}' не существует или не является директорией.")
-        return [f"Ошибка: Путь к шаблону CapCut из ENV 'CAPCUT_TEMPLATE_PATH' ('{base_template_project_path_str}') не существует или не является директорией."]
+    if not project_name: logger.error("Ошибка: 'project_name' пуст."); return ["Ошибка: 'project_name' не может быть пустым."]
+    if not isinstance(media_items_info, list): logger.error("Ошибка: 'media_items_info' не список."); return ["Ошибка: 'media_items_info' должен быть списком."]
+    if not base_template_path_str: logger.error("Ошибка: ENV 'CAPCUT_TEMPLATE_PATH' не установлен."); return ["Ошибка: Переменная окружения 'CAPCUT_TEMPLATE_PATH' не установлена или пуста."]
+    base_template_path = Path(base_template_path_str)
+    if not base_template_path.is_dir(): logger.error(f"Ошибка: Путь к шаблону '{base_template_path_str}' не директория."); return [f"Ошибка: Путь к шаблону '{base_template_path_str}' не существует или не является директорией."]
+    if not output_root_path_str: logger.error("Ошибка: ENV 'CAPCUT_PROJECTS_ROOT' не установлен."); return ["Ошибка: Переменная окружения 'CAPCUT_PROJECTS_ROOT' не установлена или пуста."]
+    output_root_path = Path(output_root_path_str)
+    if not output_root_path.is_dir():
+        try: output_root_path.mkdir(parents=True, exist_ok=True); logger.info(f"Создана директория проектов: '{output_root_path}'")
+        except Exception as e: logger.error(f"Ошибка создания директории проектов '{output_root_path_str}': {e}"); return [f"Ошибка создания директории проектов '{output_root_path_str}': {e}"]
 
-    if not output_project_root_path_str:
-        logger.error("Ошибка валидации: Переменная окружения 'CAPCUT_PROJECTS_ROOT' не установлена или пуста.")
-        return ["Ошибка: Переменная окружения 'CAPCUT_PROJECTS_ROOT' не установлена или пуста."]
-    output_project_root_path = Path(output_project_root_path_str)
-    if not output_project_root_path.is_dir():
-        try:
-            output_project_root_path.mkdir(parents=True, exist_ok=True)
-            logger.info(f"Создана корневая директория для проектов CapCut: '{output_project_root_path}'")
-        except Exception as e:
-            logger.error(f"Ошибка: Не удалось создать корневую директорию для проектов CapCut '{output_project_root_path_str}': {e}")
-            return [f"Ошибка: Не удалось создать корневую директорию для проектов CapCut '{output_project_root_path_str}': {e}"]
-
-    for i, item in enumerate(media_items_info):
-        if not isinstance(item, dict):
-            logger.error(f"Ошибка валидации: Элемент {i} в 'media_items_info' не является словарем.")
-            return [f"Ошибка: Элемент {i} в 'media_items_info' не является словарем."]
-        required_keys = ['path', 'type', 'timeline_start_ms', 'timeline_duration_ms', 'source_start_ms', 'track_index']
-        missing_keys = [key for key in required_keys if key not in item]
-        if missing_keys:
-            logger.error(f"Ошибка валидации: Элемент {i} в 'media_items_info' не содержит обязательные ключи: {', '.join(missing_keys)}.")
-            return [f"Ошибка: Элемент {i} в 'media_items_info' не содержит обязательные ключи: {', '.join(missing_keys)}."]
-        
-        item_path_str = item.get('path')
-        if not item_path_str or not Path(item_path_str).is_file(): # Проверяем, что путь есть и это файл
-            logger.error(f"Ошибка валидации: Файл '{item_path_str}' в 'media_items_info' (элемент {i}) не найден или путь не указан.")
-            return [f"Ошибка: Файл '{item_path_str}' в 'media_items_info' (элемент {i}) не найден или путь не указан."]
-        
-        for key_to_check in ['timeline_start_ms', 'timeline_duration_ms', 'source_start_ms', 'track_index']:
-            if not isinstance(item.get(key_to_check), int):
-                logger.error(f"Ошибка валидации: Ключ '{key_to_check}' в элементе {i} 'media_items_info' должен быть int. Получено: {item.get(key_to_check)} (тип: {type(item.get(key_to_check))}).")
-                return [f"Ошибка: Ключ '{key_to_check}' в элементе {i} 'media_items_info' должен быть целым числом (int). Получено: {item.get(key_to_check)} (тип: {type(item.get(key_to_check))})."]
-        if item.get('type') not in ['video', 'audio']:
-            logger.error(f"Ошибка валидации: Ключ 'type' в элементе {i} 'media_items_info' должен быть 'video' или 'audio'. Получено: {item.get('type')}.")
-            return [f"Ошибка: Ключ 'type' в элементе {i} 'media_items_info' должен быть 'video' или 'audio'. Получено: {item.get('type')}."]
+    for i, item in enumerate(media_items_info): 
+        if not isinstance(item, dict): logger.error(f"Ошибка: Элемент {i} не словарь."); return [f"Ошибка: Элемент {i} в 'media_items_info' не является словарем."]
+        req_keys = ['path','type','timeline_start_ms','timeline_duration_ms','source_start_ms','track_index']
+        missing = [k for k in req_keys if k not in item]
+        if missing: logger.error(f"Ошибка: Элемент {i} нет ключей: {missing}."); return [f"Ошибка: Элемент {i} не содержит ключи: {', '.join(missing)}."]
+        item_path = item.get('path')
+        if not item_path or not Path(item_path).is_file(): logger.error(f"Ошибка: Файл '{item_path}' элемента {i} не найден."); return [f"Ошибка: Файл '{item_path}' элемента {i} не найден."]
+        for k_int_idx in range(2, len(req_keys)): 
+            k_int = req_keys[k_int_idx]
+            if not isinstance(item.get(k_int), int): logger.error(f"Ошибка: Ключ '{k_int}' элемента {i} не int."); return [f"Ошибка: Ключ '{k_int}' элемента {i} должен быть int."]
+        if item.get('type') not in ['video','audio']: logger.error(f"Ошибка: 'type' элемента {i} некорректен."); return [f"Ошибка: 'type' элемента {i} должен быть 'video' или 'audio'."]
 
     try:
-        logger.info(f"Вызов _generate_capcut_project_logic для '{project_name}' с ориентацией: '{orientation}'")
-        
-        # Прямой вызов _generate_capcut_project_logic с передачей всех параметров
+        logger.info(f"Вызов _generate_capcut_project_logic для '{project_name}'...")
         success = _generate_capcut_project_logic(
-            project_name=project_name,
-            media_items_info=media_items_info,
-            base_template_project_path=base_template_project_path, # Передаем Path объект
-            output_project_root_path=output_project_root_path, # Передаем Path объект
-            default_fps=default_fps,
-            project_canvas_width=project_canvas_width,
-            project_canvas_height=project_canvas_height,
-            orientation=orientation, # <--- ПЕРЕДАЕМ ORIENTATION
-            logger_instance=logger 
+            project_name, media_items_info, base_template_path, output_root_path, default_fps,
+            project_canvas_width, project_canvas_height, orientation, logger_instance=logger
         )
-
         if success:
-            sanitized_name = project_name.replace(" ", "_").replace("/", "_").replace("\\", "_")
-            project_folder_path = output_project_root_path / sanitized_name
-            success_message = f"Проект CapCut '{project_name}' успешно создан. Путь: {project_folder_path.resolve()}"
-            logger.info(success_message)
-            return [success_message]
+            sane_name = project_name.replace(" ","_").replace("/","_").replace("\\","_")
+            proj_folder_path = output_root_path / sane_name
+            msg = f"Проект CapCut '{project_name}' успешно создан. Путь: {proj_folder_path.resolve()}"
+            logger.info(msg); return [msg]
         else:
-            error_message = f"Ошибка при генерации проекта CapCut '{project_name}' (_generate_capcut_project_logic вернул False)."
-            logger.error(error_message)
-            return [error_message]
-            
-    except ValueError as ve:
-        logger.error(f"Ошибка входных данных при вызове _generate_capcut_project_logic: {ve}", exc_info=True)
-        return [f"Ошибка входных данных: {ve}"]
-    except Exception as e:
-        # Используем traceback для получения полного стека ошибки, если он нужен
-        # error_details = traceback.format_exc() 
-        logger.error(f"Непредвиденная ошибка при создании проекта CapCut '{project_name}': {e}", exc_info=True)
-        return [f"Непредвиденная ошибка при создании проекта: {e}"]
+            msg = f"Ошибка генерации проекта '{project_name}' (_generate_capcut_project_logic вернул False)."
+            logger.error(msg); return [msg]
+    except ValueError as ve: logger.error(f"Ошибка входных данных: {ve}", exc_info=True); return [f"Ошибка входных данных: {ve}"]
+    except Exception as e: logger.error(f"Непредвиденная ошибка создания проекта '{project_name}': {e}", exc_info=True); return [f"Непредвиденная ошибка: {e}"]
+
+
 
 if __name__ == "__main__":
     logger.info("Запуск FastMCP сервера в режиме STDIN/STDOUT...")
