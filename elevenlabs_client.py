@@ -90,7 +90,7 @@ def call_elevenlabs_tts_api(
         return audio_bytes
 
     except ApiError as e:
-        error_message = f"Ошибка API ElevenLabs: {e.status_code} - {e.message}"
+        error_message = f"Ошибка API ElevenLabs: {getattr(e, 'status_code', 'нет кода')} - {e}"
         logger.error(error_message)
         return error_message
     except Exception as e:
