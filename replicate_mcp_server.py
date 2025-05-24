@@ -883,6 +883,149 @@ def _process_single_openai_image_request(
         # Возвращаем ошибку + все, что успели сохранить до этого
         return all_saved_files_for_request + [error_msg]
 
+# --- Инструмент MCP для Нескольких OpenAI ИЗОБРАЖЕНИЙ (Параллельный) ---
+@mcp.tool()
+def generate_and_save_multiple_openai_images(
+    image_requests: list[dict],
+    base_output_dir: str,
+    max_workers: int = 8
+) -> list[str]:
+    """
+    Генерирует или редактирует НЕСКОЛЬКО наборов изображений ПАРАЛЛЕЛЬНО с помощью OpenAI (gpt-image-1)
+    на основе списка запросов, сохраняет их в базовую директорию и пытается открыть.
+    Возвращает плоский список путей ко всем успешно сохраненным файлам и/или сообщения об ошибках.
+
+    **Для генерации одного изображения:** передайте список `image_requests` с одним элементом.
+
+    Args:
+        image_requests: Список словарей. Каждый словарь представляет один запрос
+                        и должен содержать ключ 'prompt' (str).
+                        Опциональные ключи:
+                        - 'num_outputs' (int): Кол-во изображений (по умолч. 1, игнор. при ред.).
+                        - 'size' (str): Размер ('1024x1024', '1536x1024', '1024x1536', 'auto', по умолч. '1024x1536').
+                        - 'quality' (str): Качество ('low', 'medium', 'high', 'auto', по умолч. 'medium').
+                        - 'output_filename_prefix' (str): Префикс имен файлов (по умолч. "openai_image_<index>").
+                        - 'reference_image_paths' (list[str] | None): Список путей к референсам для режима редактирования.
+                          При использовании нескольких референсов, рекомендуется указывать в промпте, какой референс за что отвечает, используя их описания или концептуальные имена (например, "Generate the monster (Grizzya) in the artistic style of the cat image").
+        base_output_dir: Абсолютный путь к базовой папке для сохранения всех изображений.
+        max_workers: Максимальное количество потоков для параллельной обработки (по умолчанию 8).
+
+    Returns:
+        Плоский список строк: содержит пути ко ВСЕМ успешно сохраненным файлам
+        из ВСЕХ запросов и/или сообщения об ошибках для каждого запроса.
+    """
+    logger.info(
+        f"Вызов generate_and_save_multiple_openai_images (ПАРАЛЛЕЛЬНО, max_workers={max_workers}): "
+        f"{len(image_requests)} запросов, base_dir='{base_output_dir}'"
+    )
+
+    all_results = []
+    processed_files_count = 0
+    error_requests_count = 0
+
+    # --- Валидация --- #
+    if not isinstance(image_requests, list):
+        return ["Ошибка: 'image_requests' должен быть списком."]
+    if not base_output_dir:
+        return ["Ошибка: 'base_output_dir' не может быть пустым."]
+
+    # --- Инициализация клиента OpenAI (ОДИН РАЗ) --- #
+    logger.debug("Инициализация клиента OpenAI для параллельной обработки...")
+    client = get_openai_client()
+    if not client:
+        error_msg = "Ошибка: Не удалось инициализировать клиент OpenAI для параллельной обработки. Проверьте API ключ."
+        logger.error(error_msg)
+        return [error_msg]
+    logger.debug("Клиент OpenAI инициализирован.")
+
+    # --- Предварительная проверка запросов --- #
+    valid_requests_with_indices = []
+    for i, req_data in enumerate(image_requests):
+        request_index = i + 1
+        if not isinstance(req_data, dict):
+            error_msg = f"Ошибка OpenAI запроса {request_index}: Элемент в 'image_requests' должен быть словарем."
+            logger.error(error_msg)
+            all_results.append(error_msg)
+            error_requests_count += 1
+            continue
+        if not req_data.get("prompt"):
+            error_msg = f"Ошибка OpenAI запроса {request_index}: Отсутствует обязательный ключ 'prompt'."
+            logger.error(error_msg)
+            all_results.append(error_msg)
+            error_requests_count += 1
+            continue
+        # Доп. валидация reference_image_paths (проверка что это список строк, если есть)
+        refs = req_data.get("reference_image_paths")
+        if refs is not None and not (isinstance(refs, list) and all(isinstance(p, str) for p in refs)):
+             error_msg = f"Ошибка OpenAI запроса {request_index}: 'reference_image_paths' должен быть списком строк."
+             logger.error(error_msg)
+             all_results.append(error_msg)
+             error_requests_count += 1
+             continue
+
+        valid_requests_with_indices.append((req_data, request_index))
+
+    if not valid_requests_with_indices:
+        logger.warning("Нет валидных OpenAI запросов для обработки.")
+        return all_results if all_results else ["Нет валидных OpenAI запросов для обработки."]
+
+    # --- Создание базовой директории --- #
+    try:
+        save_directory = Path(base_output_dir)
+        save_directory.mkdir(parents=True, exist_ok=True)
+        logger.debug(f"Базовая директория для OpenAI изображений: {save_directory.resolve()}")
+    except OSError as e:
+        error_msg = f"Ошибка создания базовой директории {save_directory}: {e}"
+        logger.exception(error_msg)
+        all_results.insert(0, error_msg)
+        return all_results
+    except Exception as e:
+        error_msg = f"Неожиданная ошибка при создании директории {base_output_dir}: {e}"
+        logger.exception(error_msg)
+        all_results.insert(0, error_msg)
+        return all_results
+
+    # --- Параллельная обработка --- #
+    futures = []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+        logger.info(f"Отправка {len(valid_requests_with_indices)} валидных OpenAI запросов в ThreadPoolExecutor...")
+        for req_data, req_index in valid_requests_with_indices:
+            future = executor.submit(
+                _process_single_openai_image_request,
+                client, # Передаем КЛИЕНТ
+                req_data,
+                req_index,
+                save_directory
+            )
+            futures.append(future)
+
+        logger.info("Ожидание завершения обработки OpenAI запросов...")
+        for future in concurrent.futures.as_completed(futures):
+            try:
+                result = future.result() # Список путей или строка ошибки
+                if isinstance(result, list):
+                    all_results.extend(result)
+                    processed_files_count += len(result)
+                elif isinstance(result, str):
+                    all_results.append(result)
+                    error_requests_count += 1
+                else:
+                    error_msg = f"Неожиданный тип результата из потока OpenAI: {type(result)}"
+                    logger.error(error_msg)
+                    all_results.append(error_msg)
+                    error_requests_count += 1
+            except Exception as e:
+                error_msg = f"Критическая ошибка при получении результата из потока OpenAI: {e}"
+                logger.exception(error_msg)
+                all_results.append(error_msg)
+                error_requests_count += 1
+
+    logger.info(
+        f"generate_and_save_multiple_openai_images (ПАРАЛЛЕЛЬНО) завершен. "
+        f"Всего сохранено файлов: {processed_files_count}, запросов с ошибками: {error_requests_count}."
+    )
+    return all_results
+
 @mcp.tool() # Раскомментируй для использования в MCP
 def create_capcut_project(
     project_name: str, media_items_info: List[Dict], default_fps: float = 30.0,
